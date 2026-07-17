@@ -148,6 +148,23 @@ class MLP(nn.Module):
         return x
 
 
+class _GroupedMM(torch.autograd.Function):
+    """torch._grouped_mm with a manual backward (autograd support is missing in 2.9):
+    dX and dW are themselves grouped GEMMs over the same offsets."""
+    @staticmethod
+    def forward(ctx, x, w, offs):
+        ctx.save_for_backward(x, w, offs)
+        return torch._grouped_mm(x, w, offs=offs)
+
+    @staticmethod
+    def backward(ctx, dy):
+        x, w, offs = ctx.saved_tensors
+        dy = dy.contiguous()
+        dx = torch._grouped_mm(dy, w.transpose(-2, -1).contiguous(), offs=offs)
+        dw = torch._grouped_mm(x.t().contiguous(), dy, offs=offs)
+        return dx, dw, None
+
+
 class MoEMLP(nn.Module):
     """
     DeepSeek-V3-style MoE FFN: fine-grained routed experts + shared expert(s).
@@ -155,6 +172,9 @@ class MoEMLP(nn.Module):
     but gate weights use the raw affinities (bias steers load only). The bias is
     updated online toward uniform expert load (aux-loss-free balancing, no
     balance loss term).
+    Experts live in two stacked 3D tensors and dispatch through a single grouped
+    GEMM per projection (sorted token order, on-GPU offsets, zero CPU syncs).
+    Muon handles the 3D params fine: its fused step is batched over leading dims.
     """
     def __init__(self, config):
         super().__init__()
@@ -164,9 +184,8 @@ class MoEMLP(nn.Module):
         self.n_topk = config.n_topk
         self.bias_update_rate = config.router_bias_update_rate
         self.router = Linear(config.n_embd, config.n_experts, bias=False)
-        # experts as individual Linears: same 2D shapes stack into the existing Muon groups
-        self.expert_fc = nn.ModuleList([Linear(config.n_embd, H, bias=False) for _ in range(config.n_experts)])
-        self.expert_proj = nn.ModuleList([Linear(H, config.n_embd, bias=False) for _ in range(config.n_experts)])
+        self.w_fc = nn.Parameter(torch.empty(config.n_experts, config.n_embd, H))
+        self.w_proj = nn.Parameter(torch.empty(config.n_experts, H, config.n_embd))
         self.shared_fc = Linear(config.n_embd, H * config.n_shared, bias=False) if config.n_shared > 0 else None
         self.shared_proj = Linear(H * config.n_shared, config.n_embd, bias=False) if config.n_shared > 0 else None
         self.register_buffer("route_bias", torch.zeros(config.n_experts)) # persistent: load balance state belongs in the checkpoint
@@ -188,25 +207,20 @@ class MoEMLP(nn.Module):
                     torch.distributed.all_reduce(load) # keep route_bias identical across ranks
                 err = load / load.sum() - 1.0 / self.n_experts
                 self.route_bias -= self.bias_update_rate * torch.sign(err)
-        # Dispatch: sort token-expert pairs by expert so each expert reads one contiguous
-        # slice. Exactly one CPU sync (the counts). Empty slices still run the (empty)
-        # matmuls so every expert gets a (zero) grad every step - Muon requires grads on
-        # all params, and early routing can starve an expert for a whole accum cycle.
+        # Dispatch: sort token-expert pairs by expert, one grouped GEMM per projection.
+        # Offsets stay on the GPU: no CPU syncs. Empty experts contribute empty groups
+        # and still receive (zero) grads - Muon requires grads on all params, and early
+        # routing can starve an expert for a whole accum cycle.
         flat_topi = topi.reshape(-1) # (N*K)
         order = flat_topi.argsort()
-        counts = torch.bincount(flat_topi, minlength=self.n_experts).tolist()
+        offs = torch.bincount(flat_topi, minlength=self.n_experts).cumsum(0).to(torch.int32)
         src = torch.arange(N, device=xf.device).repeat_interleave(self.n_topk)[order]
         xs = xf[src] # (N*K, C) grouped by expert
-        outs = []
-        start = 0
-        for e in range(self.n_experts):
-            end = start + counts[e]
-            h = self.expert_fc[e](xs[start:end])
-            h = F.relu(h).square()
-            outs.append(self.expert_proj[e](h))
-            start = end
+        h = _GroupedMM.apply(xs, self.w_fc.to(xf.dtype), offs)
+        h = F.relu(h).square()
+        out = _GroupedMM.apply(h, self.w_proj.to(xf.dtype), offs)
         y = torch.zeros_like(xf)
-        y.index_add_(0, src, torch.cat(outs) * gates.reshape(-1, 1).to(xf.dtype)[order])
+        y.index_add_(0, src, out * gates.reshape(-1, 1).to(xf.dtype)[order])
         if self.shared_fc is not None:
             y = y + self.shared_proj(F.relu(self.shared_fc(xf)).square())
         return y.view(B, T, C)
@@ -303,10 +317,8 @@ class GPT(nn.Module):
             if isinstance(block.mlp, MoEMLP):
                 torch.nn.init.uniform_(block.mlp.router.weight, -s, s)
                 torch.nn.init.zeros_(block.mlp.route_bias)
-                for fc in block.mlp.expert_fc:
-                    torch.nn.init.uniform_(fc.weight, -s * 0.4, s * 0.4)
-                for proj in block.mlp.expert_proj:
-                    torch.nn.init.zeros_(proj.weight)
+                torch.nn.init.uniform_(block.mlp.w_fc, -s * 0.4, s * 0.4)
+                torch.nn.init.zeros_(block.mlp.w_proj)
                 if block.mlp.shared_fc is not None:
                     torch.nn.init.uniform_(block.mlp.shared_fc.weight, -s * 0.4, s * 0.4)
                     torch.nn.init.zeros_(block.mlp.shared_proj.weight)
@@ -433,8 +445,8 @@ class GPT(nn.Module):
         matmul_params = sum(m.weight.numel() for m in self.modules() if isinstance(m, Linear))
         for block in self.transformer.h:
             if isinstance(block.mlp, MoEMLP):
-                expert_params = sum(l.weight.numel() for l in list(block.mlp.expert_fc) + list(block.mlp.expert_proj))
-                matmul_params -= round(expert_params * (1 - block.mlp.n_topk / block.mlp.n_experts))
+                expert_params = block.mlp.w_fc.numel() + block.mlp.w_proj.numel() # not Linears: add active fraction
+                matmul_params += round(expert_params * block.mlp.n_topk / block.mlp.n_experts)
         return matmul_params
 
     def estimate_decode_flops(self, context_len):
