@@ -208,19 +208,31 @@ class MoEMLP(nn.Module):
                 err = load / load.sum() - 1.0 / self.n_experts
                 self.route_bias -= self.bias_update_rate * torch.sign(err)
         # Dispatch: sort token-expert pairs by expert, one grouped GEMM per projection.
-        # Offsets stay on the GPU: no CPU syncs. Empty experts contribute empty groups
-        # and still receive (zero) grads - Muon requires grads on all params, and early
-        # routing can starve an expert for a whole accum cycle.
+        # Each expert's block is padded to a multiple of 16 tokens with zero rows: the
+        # grouped-GEMM wgrad kernel requires 16-byte-aligned group sizes, and zero rows
+        # contribute nothing to outputs or grads. Buffer is statically sized and offsets
+        # stay on the GPU: no CPU syncs. Empty experts still receive (zero) grads - Muon
+        # requires grads on all params, and early routing can starve an expert for a
+        # whole accum cycle.
+        K = self.n_topk
         flat_topi = topi.reshape(-1) # (N*K)
         order = flat_topi.argsort()
-        offs = torch.bincount(flat_topi, minlength=self.n_experts).cumsum(0).to(torch.int32)
-        src = torch.arange(N, device=xf.device).repeat_interleave(self.n_topk)[order]
-        xs = xf[src] # (N*K, C) grouped by expert
-        h = _GroupedMM.apply(xs, self.w_fc.to(xf.dtype), offs)
+        sorted_e = flat_topi[order]
+        counts = torch.bincount(flat_topi, minlength=self.n_experts)
+        pcounts = ((counts + 15) // 16) * 16
+        poffs = pcounts.cumsum(0).to(torch.int32)
+        cum0 = counts.cumsum(0) - counts # start of each expert's block in sorted order
+        pstart = pcounts.cumsum(0) - pcounts # start of each expert's block in padded order
+        within = torch.arange(N * K, device=xf.device) - cum0.gather(0, sorted_e)
+        pos = pstart.gather(0, sorted_e) + within # padded slot of each sorted token
+        src = torch.arange(N, device=xf.device).repeat_interleave(K)[order]
+        P = N * K + 16 * self.n_experts # static upper bound on padded rows
+        xs = torch.zeros(P, C, device=xf.device, dtype=xf.dtype).index_add(0, pos, xf[src])
+        h = _GroupedMM.apply(xs, self.w_fc.to(xf.dtype), poffs)
         h = F.relu(h).square()
-        out = _GroupedMM.apply(h, self.w_proj.to(xf.dtype), offs)
+        out = _GroupedMM.apply(h, self.w_proj.to(xf.dtype), poffs)
         y = torch.zeros_like(xf)
-        y.index_add_(0, src, out * gates.reshape(-1, 1).to(xf.dtype)[order])
+        y.index_add_(0, src, out.index_select(0, pos) * gates.reshape(-1, 1).to(xf.dtype)[order])
         if self.shared_fc is not None:
             y = y + self.shared_proj(F.relu(self.shared_fc(xf)).square())
         return y.view(B, T, C)
