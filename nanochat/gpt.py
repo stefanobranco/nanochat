@@ -188,18 +188,25 @@ class MoEMLP(nn.Module):
                     torch.distributed.all_reduce(load) # keep route_bias identical across ranks
                 err = load / load.sum() - 1.0 / self.n_experts
                 self.route_bias -= self.bias_update_rate * torch.sign(err)
-        y = torch.zeros_like(xf)
+        # Dispatch: sort token-expert pairs by expert so each expert reads one contiguous
+        # slice. Exactly one CPU sync (the counts). Empty slices still run the (empty)
+        # matmuls so every expert gets a (zero) grad every step - Muon requires grads on
+        # all params, and early routing can starve an expert for a whole accum cycle.
         flat_topi = topi.reshape(-1) # (N*K)
-        flat_gates = gates.reshape(-1, 1).to(xf.dtype)
-        token_idx = torch.arange(N, device=xf.device).repeat_interleave(self.n_topk)
+        order = flat_topi.argsort()
+        counts = torch.bincount(flat_topi, minlength=self.n_experts).tolist()
+        src = torch.arange(N, device=xf.device).repeat_interleave(self.n_topk)[order]
+        xs = xf[src] # (N*K, C) grouped by expert
+        outs = []
+        start = 0
         for e in range(self.n_experts):
-            sel = flat_topi == e
-            idx = token_idx[sel]
-            if idx.numel() == 0:
-                continue
-            h = self.expert_fc[e](xf[idx])
+            end = start + counts[e]
+            h = self.expert_fc[e](xs[start:end])
             h = F.relu(h).square()
-            y.index_add_(0, idx, self.expert_proj[e](h) * flat_gates[sel])
+            outs.append(self.expert_proj[e](h))
+            start = end
+        y = torch.zeros_like(xf)
+        y.index_add_(0, src, torch.cat(outs) * gates.reshape(-1, 1).to(xf.dtype)[order])
         if self.shared_fc is not None:
             y = y + self.shared_proj(F.relu(self.shared_fc(xf)).square())
         return y.view(B, T, C)
