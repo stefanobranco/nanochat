@@ -378,7 +378,11 @@ class MuonAdamW(torch.optim.Optimizer):
         if "momentum_buffer" not in state:
             state["momentum_buffer"] = torch.zeros(chunk_size, *shape, dtype=dtype, device=device)
         if "second_momentum_buffer" not in state:
-            state_shape = (chunk_size, shape[-2], 1) if shape[-2] >= shape[-1] else (chunk_size, 1, shape[-1])
+            # keep leading dims (params can be 3D stacks, e.g. MoE experts (E, m, n)), factor the trailing matrix dims
+            if shape[-2] >= shape[-1]:
+                state_shape = (chunk_size, *shape[:-1], 1)
+            else:
+                state_shape = (chunk_size, *shape[:-2], 1, shape[-1])
             state["second_momentum_buffer"] = torch.zeros(state_shape, dtype=dtype, device=device)
         red_dim = -1 if shape[-2] >= shape[-1] else -2
 
