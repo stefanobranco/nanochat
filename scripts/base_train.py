@@ -52,6 +52,13 @@ parser.add_argument("--aspect-ratio", type=int, default=64, help="model_dim = de
 parser.add_argument("--head-dim", type=int, default=128, help="target head dimension for attention")
 parser.add_argument("--max-seq-len", type=int, default=2048, help="max context length")
 parser.add_argument("--window-pattern", type=str, default="SSSL", help="sliding window pattern tiled across layers: L=full, S=half context (e.g. 'SSL')")
+# MoE (n-experts=0 = dense baseline). NOTE: with MoE, prefer --num-iterations for
+# iso-token comparisons; target-param-data-ratio counts total (not active) params.
+parser.add_argument("--n-experts", type=int, default=0, help="number of routed experts per MoE layer (0 = dense)")
+parser.add_argument("--n-topk", type=int, default=4, help="active routed experts per token")
+parser.add_argument("--n-shared", type=int, default=1, help="always-on shared experts per MoE layer")
+parser.add_argument("--expert-hidden", type=int, default=0, help="hidden dim per expert (0 = model dim)")
+parser.add_argument("--moe-first-dense", type=int, default=1, help="keep this many initial layers dense")
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
 parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
@@ -137,6 +144,8 @@ def build_model_meta(depth):
         sequence_len=args.max_seq_len, vocab_size=vocab_size,
         n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
         window_pattern=args.window_pattern,
+        n_experts=args.n_experts, n_topk=args.n_topk, n_shared=args.n_shared,
+        expert_hidden=args.expert_hidden, moe_first_dense=args.moe_first_dense,
     )
     with torch.device("meta"):
         model_meta = GPT(config)

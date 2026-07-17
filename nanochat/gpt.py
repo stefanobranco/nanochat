@@ -37,6 +37,13 @@ class GPTConfig:
     # Characters: L=long (full context), S=short (quarter context)
     # Examples: "L"=all full context, "SL"=alternating, "SSL"=two short then one long
     window_pattern: str = "SSSL"
+    # MoE (DeepSeek-V3 recipe). n_experts=0 means dense, identical to baseline.
+    n_experts: int = 0
+    n_topk: int = 4 # active routed experts per token
+    n_shared: int = 1 # always-on shared experts
+    expert_hidden: int = 0 # hidden dim per expert; 0 = n_embd (i.e. 1/4 of the dense 4x MLP)
+    moe_first_dense: int = 1 # keep this many initial layers dense
+    router_bias_update_rate: float = 1e-3 # aux-loss-free balancing bias step size
 
 
 def norm(x):
@@ -141,11 +148,69 @@ class MLP(nn.Module):
         return x
 
 
+class MoEMLP(nn.Module):
+    """
+    DeepSeek-V3-style MoE FFN: fine-grained routed experts + shared expert(s).
+    Sigmoid routing affinities; top-k selection uses affinity + per-expert bias,
+    but gate weights use the raw affinities (bias steers load only). The bias is
+    updated online toward uniform expert load (aux-loss-free balancing, no
+    balance loss term).
+    """
+    def __init__(self, config):
+        super().__init__()
+        assert config.n_experts > 0 and config.n_topk <= config.n_experts
+        H = config.expert_hidden if config.expert_hidden > 0 else config.n_embd
+        self.n_experts = config.n_experts
+        self.n_topk = config.n_topk
+        self.bias_update_rate = config.router_bias_update_rate
+        self.router = Linear(config.n_embd, config.n_experts, bias=False)
+        # experts as individual Linears: same 2D shapes stack into the existing Muon groups
+        self.expert_fc = nn.ModuleList([Linear(config.n_embd, H, bias=False) for _ in range(config.n_experts)])
+        self.expert_proj = nn.ModuleList([Linear(H, config.n_embd, bias=False) for _ in range(config.n_experts)])
+        self.shared_fc = Linear(config.n_embd, H * config.n_shared, bias=False) if config.n_shared > 0 else None
+        self.shared_proj = Linear(H * config.n_shared, config.n_embd, bias=False) if config.n_shared > 0 else None
+        self.register_buffer("route_bias", torch.zeros(config.n_experts)) # persistent: load balance state belongs in the checkpoint
+
+    @torch.compiler.disable # data-dependent expert token counts would cause recompile storms
+    def forward(self, x):
+        B, T, C = x.size()
+        xf = x.view(-1, C)
+        N = xf.size(0)
+        affinity = torch.sigmoid(self.router(xf).float()) # (N, E)
+        _, topi = (affinity + self.route_bias).topk(self.n_topk, dim=-1) # (N, K), bias steers selection only
+        gates = affinity.gather(-1, topi)
+        gates = gates / gates.sum(-1, keepdim=True) # normalize over the selected experts
+        if self.training:
+            with torch.no_grad():
+                load = torch.zeros(self.n_experts, device=xf.device)
+                load.scatter_add_(0, topi.reshape(-1), torch.ones(topi.numel(), device=xf.device))
+                if torch.distributed.is_initialized():
+                    torch.distributed.all_reduce(load) # keep route_bias identical across ranks
+                err = load / load.sum() - 1.0 / self.n_experts
+                self.route_bias -= self.bias_update_rate * torch.sign(err)
+        y = torch.zeros_like(xf)
+        flat_topi = topi.reshape(-1) # (N*K)
+        flat_gates = gates.reshape(-1, 1).to(xf.dtype)
+        token_idx = torch.arange(N, device=xf.device).repeat_interleave(self.n_topk)
+        for e in range(self.n_experts):
+            sel = flat_topi == e
+            idx = token_idx[sel]
+            if idx.numel() == 0:
+                continue
+            h = self.expert_fc[e](xf[idx])
+            h = F.relu(h).square()
+            y.index_add_(0, idx, self.expert_proj[e](h) * flat_gates[sel])
+        if self.shared_fc is not None:
+            y = y + self.shared_proj(F.relu(self.shared_fc(xf)).square())
+        return y.view(B, T, C)
+
+
 class Block(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
         self.attn = CausalSelfAttention(config, layer_idx)
-        self.mlp = MLP(config)
+        use_moe = config.n_experts > 0 and layer_idx >= config.moe_first_dense
+        self.mlp = MoEMLP(config) if use_moe else MLP(config)
 
     def forward(self, x, ve, cos_sin, window_size, kv_cache):
         x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache)
@@ -228,8 +293,19 @@ class GPT(nn.Module):
             torch.nn.init.uniform_(block.attn.c_k.weight, -s, s)
             torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
             torch.nn.init.zeros_(block.attn.c_proj.weight) # projections are zero
-            torch.nn.init.uniform_(block.mlp.c_fc.weight, -s * 0.4, s * 0.4)  # 0.4x init scale for c_fc
-            torch.nn.init.zeros_(block.mlp.c_proj.weight)
+            if isinstance(block.mlp, MoEMLP):
+                torch.nn.init.uniform_(block.mlp.router.weight, -s, s)
+                torch.nn.init.zeros_(block.mlp.route_bias)
+                for fc in block.mlp.expert_fc:
+                    torch.nn.init.uniform_(fc.weight, -s * 0.4, s * 0.4)
+                for proj in block.mlp.expert_proj:
+                    torch.nn.init.zeros_(proj.weight)
+                if block.mlp.shared_fc is not None:
+                    torch.nn.init.uniform_(block.mlp.shared_fc.weight, -s * 0.4, s * 0.4)
+                    torch.nn.init.zeros_(block.mlp.shared_proj.weight)
+            else:
+                torch.nn.init.uniform_(block.mlp.c_fc.weight, -s * 0.4, s * 0.4)  # 0.4x init scale for c_fc
+                torch.nn.init.zeros_(block.mlp.c_proj.weight)
 
         # Per-layer scalars
         # Per-layer resid init: stronger residual at early layers, weaker at deep layers
@@ -344,8 +420,14 @@ class GPT(nn.Module):
         i.e. contribute 2 FLOPs/param to the forward pass. Counted structurally: every
         matmul in this model goes through the Linear class, while non-matmul params
         (embeddings = lookups, per-layer scalars) are nn.Embedding or raw Parameters.
+        For MoE, only the top-k routed experts touch each token, so inactive expert
+        params are excluded (this is a FLOPs count, not a storage count).
         """
         matmul_params = sum(m.weight.numel() for m in self.modules() if isinstance(m, Linear))
+        for block in self.transformer.h:
+            if isinstance(block.mlp, MoEMLP):
+                expert_params = sum(l.weight.numel() for l in list(block.mlp.expert_fc) + list(block.mlp.expert_proj))
+                matmul_params -= round(expert_params * (1 - block.mlp.n_topk / block.mlp.n_experts))
         return matmul_params
 
     def estimate_decode_flops(self, context_len):
@@ -420,14 +502,16 @@ class GPT(nn.Module):
         model_dim = self.config.n_embd
 
         # Separate out all parameters into groups
-        matrix_params = list(self.transformer.h.parameters())
+        # MoE routers go to AdamW, not Muon: orthogonalizing a routing matrix distorts the affinities
+        router_params = [p for n, p in self.transformer.h.named_parameters() if "router" in n]
+        matrix_params = [p for n, p in self.transformer.h.named_parameters() if "router" not in n]
         value_embeds_params = list(self.value_embeds.parameters())
         embedding_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
         smear_params = [self.smear_gate.weight, self.smear_lambda, self.backout_lambda]
-        assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params) + len(smear_params)
+        assert len(list(self.parameters())) == len(matrix_params) + len(router_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params) + len(smear_params)
 
         # Scale the LR for the AdamW parameters by ∝1/√dmodel (tuned for 768 dim model)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
@@ -443,6 +527,8 @@ class GPT(nn.Module):
             dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),  # higher beta1 for x0
             dict(kind='adamw', params=smear_params, lr=0.2, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0),
         ]
+        if router_params:
+            param_groups.append(dict(kind='adamw', params=router_params, lr=unembedding_lr * dmodel_lr_scale, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0))
         # Muon groups (matrix params, grouped by shape for stacking)
         for shape in sorted({p.shape for p in matrix_params}):
             group_params = [p for p in matrix_params if p.shape == shape]
