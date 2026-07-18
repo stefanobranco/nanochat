@@ -193,7 +193,11 @@ class MoEMLP(nn.Module):
         self.shared_proj = Linear(H * config.n_shared, config.n_embd, bias=False) if config.n_shared > 0 else None
         self.register_buffer("route_bias", torch.zeros(config.n_experts)) # persistent: load balance state belongs in the checkpoint
 
-    @torch.compiler.disable # data-dependent expert token counts would cause recompile storms
+    # NOTE: no torch.compiler.disable here. Since the padded-dispatch rewrite every
+    # tensor in this path has a static shape (P is a fixed upper bound), so compile
+    # only graph-breaks at the _grouped_mm custom Function instead of fragmenting
+    # around the whole MoE layer. Validated by preflight; revert this commit if a
+    # recompile storm appears on a new torch version.
     def forward(self, x):
         B, T, C = x.size()
         xf = x.view(-1, C)
