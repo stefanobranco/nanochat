@@ -44,6 +44,7 @@ class GPTConfig:
     expert_hidden: int = 0 # hidden dim per expert; 0 = n_embd (i.e. 1/4 of the dense 4x MLP)
     moe_first_dense: int = 1 # keep this many initial layers dense
     router_bias_update_rate: float = 1e-3 # aux-loss-free balancing bias step size
+    router_affinity: str = "sigmoid" # sigmoid (DSv3) | sqrtsoftplus (DSv4)
 
 
 def norm(x):
@@ -183,6 +184,8 @@ class MoEMLP(nn.Module):
         self.n_experts = config.n_experts
         self.n_topk = config.n_topk
         self.bias_update_rate = config.router_bias_update_rate
+        assert config.router_affinity in ("sigmoid", "sqrtsoftplus")
+        self.router_affinity = config.router_affinity
         self.router = Linear(config.n_embd, config.n_experts, bias=False)
         self.w_fc = nn.Parameter(torch.empty(config.n_experts, config.n_embd, H))
         self.w_proj = nn.Parameter(torch.empty(config.n_experts, H, config.n_embd))
@@ -195,7 +198,11 @@ class MoEMLP(nn.Module):
         B, T, C = x.size()
         xf = x.view(-1, C)
         N = xf.size(0)
-        affinity = torch.sigmoid(self.router(xf).float()) # (N, E)
+        router_logits = self.router(xf).float() # (N, E)
+        if self.router_affinity == "sigmoid":
+            affinity = torch.sigmoid(router_logits)
+        else: # sqrtsoftplus (DSv4): unbounded positive affinity, no saturation
+            affinity = F.softplus(router_logits).sqrt()
         _, topi = (affinity + self.route_bias).topk(self.n_topk, dim=-1) # (N, K), bias steers selection only
         gates = affinity.gather(-1, topi)
         gates = gates / gates.sum(-1, keepdim=True) # normalize over the selected experts
