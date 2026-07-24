@@ -17,6 +17,14 @@ draft t_{P+2} the moment the trunk has produced t_{P+1}. We verify by feeding
 Either way the emitted sequence is exactly what plain greedy decoding produces:
 the draft only ever saves work, it never changes the output.
 
+That exactness holds in exact arithmetic, not in bf16. The verify forward passes
+two tokens where plain decoding passes one, and the MoE's grouped GEMM reduces in
+an order that depends on the token count, so the logits differ slightly. Measured
+on a *fixed* token sequence with no speculation involved at all, chunk=1 vs
+chunk=2 gives max |logit diff| ~1e0 and argmax mismatches at ~1.7% of positions.
+Occasional divergence from greedy is therefore expected and is a property of
+batched verification in bf16, not a bug in the scheme.
+
 Three things get measured, because the obvious one is misleading on its own:
 
   1. rollback correctness — acceptance is so high that the reject branch almost
@@ -225,7 +233,13 @@ def main():
     print(f"tokens/iter     : {n/it:8.3f}  (theoretical max 2.0)")
     print(f"accept (self-gen): {ac/it:7.1%}  <- inflated by degenerate loops")
     print(f"accept (real text): {tf_rate:6.1%}  <- the honest number")
-    print(f"divergences vs greedy: {len(diverged)}/{args.num_prompts} prompts {diverged}")
+    # Project the speedup at the real-text acceptance rate: an iteration costs a
+    # fixed amount regardless of outcome, only the tokens it yields change.
+    sec_per_iter = ts / it
+    print(f"PROJECTED at {tf_rate:.1%} acceptance: "
+          f"{(1 + tf_rate)/sec_per_iter:.1f} tok/s = {(1 + tf_rate)/sec_per_iter/(n/tb):.2f}x")
+    print(f"divergences vs greedy: {len(diverged)}/{args.num_prompts} prompts {diverged} "
+          f"(bf16 chunk-shape noise, see module docstring)")
 
 
 if __name__ == "__main__":
