@@ -191,19 +191,20 @@ class _GatherPermute(torch.autograd.Function):
     here would corrupt gradients only intermittently, under memory pressure.
     """
     @staticmethod
-    def forward(ctx, xf, gidx, pos, src, pad_idx):
-        ctx.save_for_backward(pos, src)
-        ctx.n_rows = xf.size(0)
+    def forward(ctx, xf, gidx, perm, pad_idx, K):
+        ctx.save_for_backward(perm)
+        ctx.n_rows, ctx.K = xf.size(0), K
         xs = xf.index_select(0, gidx)
         xs.index_fill_(0, pad_idx, 0) # pad rows enter the GEMM; they must be exactly zero
         return xs
 
     @staticmethod
     def backward(ctx, g):
-        pos, src = ctx.saved_tensors
-        dxf = torch.zeros(ctx.n_rows, g.size(1), dtype=g.dtype, device=g.device)
-        dxf.index_add_(0, src, g.index_select(0, pos)) # only real slots contribute
-        return dxf, None, None, None, None
+        # perm[n*K + k] is the padded slot holding token n's k-th expert, so gathering
+        # through it lands a token's K contributions adjacent and the accumulation is a
+        # plain reduction over K — no atomics, and pad/tail rows are never touched.
+        (perm,) = ctx.saved_tensors
+        return g.index_select(0, perm).view(ctx.n_rows, ctx.K, -1).sum(1), None, None, None, None
 
 
 class MoEMLP(nn.Module):
@@ -294,15 +295,17 @@ class MoEMLP(nn.Module):
         pad_idx = torch.where(r16 < (pcounts - counts).unsqueeze(1),
                               (pstart + counts).unsqueeze(1) + r16,
                               torch.full_like(counts[:1], P - 1).unsqueeze(1))
-        xs = _GatherPermute.apply(xf, gidx, pos, src, pad_idx.reshape(-1))
+        # inverse permutation: perm[n*K + k] = padded slot of pair (n, k). Used by
+        # both the output combine below and _GatherPermute's backward.
+        perm = torch.zeros(N * K, dtype=torch.long, device=xf.device)
+        perm.index_copy_(0, order, pos)
+        xs = _GatherPermute.apply(xf, gidx, perm, pad_idx.reshape(-1), K)
         h = F.grouped_mm(xs, self.w_fc.to(xf.dtype), offs=poffs)
         h = F.relu(h).square()
         out = F.grouped_mm(h, self.w_proj.to(xf.dtype), offs=poffs)
         # D2: gather back through the inverse permutation so each token's K expert
         # outputs land adjacent, then reduce over K. Replaces a gather + an atomic
         # index_add_ (and drops the gate permutation: gates is already in (N,K) order).
-        perm = torch.zeros(N * K, dtype=torch.long, device=xf.device)
-        perm.index_copy_(0, order, pos) # perm[n*K+k] = padded slot of pair (n, k)
         y = (out.index_select(0, perm).view(N, K, C) * gates.unsqueeze(-1).to(xf.dtype)).sum(1)
         if self.shared_fc is not None:
             y = y + self.shared_proj(F.relu(self.shared_fc(xf)).square())
