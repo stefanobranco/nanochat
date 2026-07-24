@@ -64,6 +64,7 @@ parser.add_argument("--n-streams", type=int, default=1, help="mHC residual strea
 parser.add_argument("--n-mtp", type=int, default=0, help="MTP depth (DSv3 multi-token prediction); 0 = off")
 parser.add_argument("--attn-res", action="store_true", help="AttnRes (Kimi arXiv 2603.15031), Full variant; replaces the residual stream")
 parser.add_argument("--fused-ce", action="store_true", help="fuse the vocab projection into the loss (skips materializing fp32 logits; matters twice over with MTP)")
+parser.add_argument("--compile-mode", type=str, default="default", choices=["default", "max-autotune", "max-autotune-no-cudagraphs", "reduce-overhead"], help="torch.compile mode; max-autotune trades a longer compile for tuned kernels")
 parser.add_argument("--mtp-weight", type=float, default=0.3, help="MTP auxiliary loss weight")
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
@@ -263,7 +264,9 @@ def disable_fp8(model):
 # Compile the model
 
 orig_model = model # original, uncompiled model, for saving raw model state_dict and for inference/evaluation (because the shapes may change shape)
-model = torch.compile(model, dynamic=False) # the inputs to model will never change shape so dynamic=False is safe
+# the inputs to model will never change shape so dynamic=False is safe
+model = torch.compile(model, dynamic=False,
+                      **({} if args.compile_mode == "default" else {"mode": args.compile_mode}))
 
 # -----------------------------------------------------------------------------
 # Scaling laws and muP extrapolations to determine the optimal training horizon, batch size, learning rates, weight decay.
