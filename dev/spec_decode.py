@@ -92,9 +92,15 @@ def baseline(prompt_ids, n_new):
 
 
 @torch.inference_mode()
-def speculative(prompt_ids, n_new):
+def speculative(prompt_ids, n_new, force_reject=False):
     """Self-speculative decoding with the MTP head. Returns (tokens, seconds,
-    n_iters, n_accepted)."""
+    n_iters, n_accepted).
+
+    force_reject takes the rejection branch on every iteration regardless of
+    whether the draft matched. Acceptance is normally so high that the rollback
+    path is barely exercised, so this is how we actually test it: the emitted
+    tokens must still equal plain greedy decoding.
+    """
     L = len(prompt_ids)
     total = L + n_new + 8
     cache = make_cache(model.config.n_layer, total)
@@ -119,7 +125,7 @@ def speculative(prompt_ids, n_new):
         logits, h0 = model.forward(pair, kv_cache=cache, return_hidden=True)
         true_next = int(logits[0, 0].argmax())  # what the trunk really predicts after `nxt`
 
-        if true_next == draft:
+        if true_next == draft and not force_reject:
             accepted += 1
             out.extend([nxt, draft])
             follow = int(logits[0, 1].argmax())  # valid: the input at this position was correct
