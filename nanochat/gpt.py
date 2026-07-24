@@ -19,6 +19,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from nanochat.fused_ce import linear_cross_entropy
+
 from nanochat.common import get_dist_info, print0, COMPUTE_DTYPE
 from nanochat.optim import MuonAdamW
 
@@ -55,6 +57,9 @@ class GPTConfig:
     # a transformer block + projection, sharing wte + lm_head. Training-only aux loss.
     n_mtp: int = 0
     mtp_weight: float = 0.3
+    # Fuse the vocab projection into the loss instead of materializing fp32 logits.
+    # MTP makes this matter twice over. Training only (the 'mean' reduction).
+    fused_ce: bool = False
 
 
 def norm(x):
@@ -921,14 +926,29 @@ class GPT(nn.Module):
 
         # Forward the lm_head (compute logits)
         shared_head = self.lm_head_logits # norm already applied by caller
-        logits = shared_head(h0) # (B, T, vocab_size)
 
         if targets is None:
             # inference: just return the logits (MTP modules are unused for plain
             # decoding; self-speculative decoding asks for h0 via return_hidden)
+            logits = shared_head(h0) # (B, T, vocab_size)
             return (logits, h0) if return_hidden else logits
 
-        loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
+        # The fused path never materializes the (B*T, vocab) fp32 logits, which are
+        # the largest tensor in the step and are built twice once MTP is on. It only
+        # implements the mean reduction; bpb eval asks for 'none' and takes the
+        # plain path below.
+        fused = self.config.fused_ce and loss_reduction == 'mean'
+        head_w = self.lm_head.weight[:self.config.vocab_size]
+
+        def head_loss(h, tgt):
+            if fused:
+                return linear_cross_entropy(h.view(-1, h.size(-1)), head_w.to(h.dtype),
+                                            tgt.reshape(-1), softcap=15.0, ignore_index=-1)
+            lg = shared_head(h)
+            return F.cross_entropy(lg.view(-1, lg.size(-1)), tgt.reshape(-1),
+                                   ignore_index=-1, reduction=loss_reduction)
+
+        loss = head_loss(h0, targets)
 
         # Multi-Token Prediction (DeepSeek-V3): sequential modules predict t+2, t+3, ...
         # Each depth k combines the previous depth's hidden with the embedding of the
@@ -943,9 +963,8 @@ class GPT(nn.Module):
                 emb_ahead = F.pad(emb[:, k:], (0, 0, 0, k))                    # Emb(t_{i+k}), tail zero-padded
                 hin = self.mtp_proj[k-1](torch.cat([norm(h_prev), emb_ahead], dim=-1))
                 h_k = self.mtp_blocks[k-1](hin, None, cos_sin, self.window_sizes[-1], None)
-                logits_k = shared_head(norm(h_k))
                 tgt_k = F.pad(targets[:, k:], (0, k), value=-1)               # predict t_{i+k+1}
-                mtp_losses.append(F.cross_entropy(logits_k.reshape(-1, logits_k.size(-1)), tgt_k.reshape(-1), ignore_index=-1))
+                mtp_losses.append(head_loss(norm(h_k), tgt_k))
                 h_prev = h_k
             loss = loss + self.config.mtp_weight * torch.stack(mtp_losses).mean()
 
