@@ -71,9 +71,16 @@ loss = m(torch.randint(0, 256, (2, 32)), torch.randint(0, 256, (2, 32)))
 loss.backward()
 check("every trainable param receives a grad",
       not [n for n, p in m.named_parameters() if p.requires_grad and p.grad is None])
-check("pseudo-queries receive a grad",
-      all(p.grad is not None and float(p.grad.abs().sum()) > 0
-          for n, p in m.named_parameters() if "attn_res" in n))
+
+# The first sublayer has exactly one source (the embedding), so its softmax is 1
+# regardless of the query: that pseudo-query is mathematically dead. It must still
+# get a real zero grad rather than None — short-circuiting the S==1 case would give
+# it grad=None and crash the fused AdamW step, which is how the mHC run first died.
+qgrads = [(n, float(p.grad.abs().sum())) for n, p in m.named_parameters() if "attn_res" in n]
+check("first pseudo-query has grad 0 (single source, softmax is constant)",
+      qgrads[0][1] == 0.0)
+check("every other pseudo-query receives a nonzero grad",
+      all(g > 0 for _, g in qgrads[1:]))
 
 print("PASS" if ok else "FAIL")
 raise SystemExit(0 if ok else 1)

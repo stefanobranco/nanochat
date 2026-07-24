@@ -375,6 +375,10 @@ class AttnRes(nn.Module):
         self.q = nn.Parameter(torch.zeros(config.n_embd)) # zero-init is load-bearing
 
     def forward(self, sources):
+        # NOTE: the first instance sees a single source (the embedding), so its
+        # softmax is identically 1 and its pseudo-query is dead. We deliberately do
+        # NOT short-circuit that case: running the softmax anyway keeps the grad at
+        # zero rather than None, and a None grad crashes the fused AdamW step.
         q = self.q.to(sources[0].dtype)
         # Score each source separately rather than stacking: a stacked (S,B,T,C)
         # buffer would be ~1GB per call at d12/bs16, and only the (S,B,T) scores
