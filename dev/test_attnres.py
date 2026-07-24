@@ -67,6 +67,15 @@ check(f"2*n_layer+1 == {2 * cfg.n_layer + 1} pseudo-queries", n_q == 2 * cfg.n_l
 m.setup_optimizer()
 check("resid/x0 lambdas frozen", not m.resid_lambdas.requires_grad and not m.x0_lambdas.requires_grad)
 m.train()
+# nanochat zero-inits every sublayer output projection, so at step 0 all sources
+# except the embedding are identically zero AND the gradient back through them is
+# zero — no pseudo-query would see signal. That is a property of the init instant,
+# not of the mechanism, so nudge the projections off zero (as one optimizer step
+# would) before asking whether gradients flow.
+with torch.no_grad():
+    for n, p in m.named_parameters():
+        if "c_proj" in n or "w_proj" in n:
+            p.normal_(0, 0.02)
 loss = m(torch.randint(0, 256, (2, 32)), torch.randint(0, 256, (2, 32)))
 loss.backward()
 check("every trainable param receives a grad",
