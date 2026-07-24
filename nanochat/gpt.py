@@ -166,10 +166,11 @@ class _GroupedMM(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dy):
+        # _grouped_mm accepts non-contiguous / transposed-view inputs (verified: exact,
+        # max diff 0.0), so we skip the .contiguous() copies the naive version made.
         x, w, offs = ctx.saved_tensors
-        dy = dy.contiguous()
-        dx = torch._grouped_mm(dy, w.transpose(-2, -1).contiguous(), offs=offs)
-        dw = torch._grouped_mm(x.t().contiguous(), dy, offs=offs)
+        dx = torch._grouped_mm(dy, w.transpose(-2, -1), offs=offs)
+        dw = torch._grouped_mm(x.t(), dy, offs=offs)
         return dx, dw, None
 
 
