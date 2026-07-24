@@ -156,22 +156,11 @@ class MLP(nn.Module):
         return x
 
 
-class _GroupedMM(torch.autograd.Function):
-    """torch._grouped_mm with a manual backward (autograd support is missing in 2.9):
-    dX and dW are themselves grouped GEMMs over the same offsets."""
-    @staticmethod
-    def forward(ctx, x, w, offs):
-        ctx.save_for_backward(x, w, offs)
-        return torch._grouped_mm(x, w, offs=offs)
-
-    @staticmethod
-    def backward(ctx, dy):
-        # _grouped_mm accepts non-contiguous / transposed-view inputs (verified: exact,
-        # max diff 0.0), so we skip the .contiguous() copies the naive version made.
-        x, w, offs = ctx.saved_tensors
-        dx = torch._grouped_mm(dy, w.transpose(-2, -1), offs=offs)
-        dw = torch._grouped_mm(x.t(), dy, offs=offs)
-        return dx, dw, None
+# NOTE: we used to wrap torch._grouped_mm in a custom autograd.Function because
+# autograd support was missing in torch 2.9. As of 2.12 the public F.grouped_mm
+# carries its own backward, verified bit-identical to the manual dX/dW formulas we
+# had written. Dropping the Function also drops two graph breaks per MoE layer,
+# which lets inductor fuse the surrounding cast/relu-square work.
 
 
 class _GatherPermute(torch.autograd.Function):
@@ -288,9 +277,9 @@ class MoEMLP(nn.Module):
                               (pstart + counts).unsqueeze(1) + r16,
                               torch.full_like(counts[:1], P - 1).unsqueeze(1))
         xs = _GatherPermute.apply(xf, gidx, pos, src, pad_idx.reshape(-1))
-        h = _GroupedMM.apply(xs, self.w_fc.to(xf.dtype), poffs)
+        h = F.grouped_mm(xs, self.w_fc.to(xf.dtype), offs=poffs)
         h = F.relu(h).square()
-        out = _GroupedMM.apply(h, self.w_proj.to(xf.dtype), poffs)
+        out = F.grouped_mm(h, self.w_proj.to(xf.dtype), offs=poffs)
         # D2: gather back through the inverse permutation so each token's K expert
         # outputs land adjacent, then reduce over K. Replaces a gather + an atomic
         # index_add_ (and drops the gate permutation: gates is already in (N,K) order).
