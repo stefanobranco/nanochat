@@ -33,6 +33,10 @@ def ref(dtype):
             e = topi[t, j].item()
             h = torch.relu(xf[t] @ wfc[e]).square()
             yy = yy.index_add(0, torch.tensor([t], device="cuda"), ((h @ wpr[e]) * gates[t, j].to(dtype)).unsqueeze(0))
+    # the shared expert also feeds x.grad, so dX only matches if we model it too
+    wsf = m.shared_fc.weight.detach().to(dtype)
+    wsp = m.shared_proj.weight.detach().to(dtype)
+    yy = yy + torch.relu(xf @ wsf.t()).square() @ wsp.t()
     yy.sum().backward()
     return wfc.grad.float(), xf.grad.float().view(2, 16, 64)
 
