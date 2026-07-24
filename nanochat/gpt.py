@@ -750,9 +750,10 @@ class GPT(nn.Module):
         consecutive positions; idx_ahead: (B, T) the token one position ahead of
         each. Returns (logits, h_k), where logits predict the token *two* ahead.
         kv_cache is the MTP module's own cache and must be kept dense over token
-        positions so attention matches what the module saw during training.
+        positions so attention matches what the module saw during training. Pass
+        kv_cache=None to run over a whole sequence exactly as training does.
         """
-        T0, T = kv_cache.get_pos(), h_prev.size(1)
+        T0, T = (0 if kv_cache is None else kv_cache.get_pos()), h_prev.size(1)
         cos_sin = self.cos[:, T0:T0+T], self.sin[:, T0:T0+T]
         emb_ahead = norm(self.transformer.wte(idx_ahead).to(h_prev.dtype))
         hin = self.mtp_proj[depth](torch.cat([norm(h_prev), emb_ahead], dim=-1))
