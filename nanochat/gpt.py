@@ -174,6 +174,36 @@ class _GroupedMM(torch.autograd.Function):
         return dx, dw, None
 
 
+class _GatherPermute(torch.autograd.Function):
+    """Materialize the expert-sorted, padded activation buffer with a SINGLE gather.
+
+    The obvious spelling — zeros(P,C).index_copy_(0, pos, xf[src]) — moves P*C
+    activations three times (memset, gather into sorted order, scatter into padded
+    order). Instead we scatter the *indices* (P int64s, ~1MB) once and let one
+    index_select do the data movement: 1 read + 1 write.
+
+    The catch is autograd. index_select's own backward would index_add over every
+    row of gidx, including pad rows and the unused tail — and grouped_mm leaves the
+    tail of its dx output uninitialized, so that garbage would land in xf. We supply
+    the backward ourselves, restricted to the real (pos -> src) pairs, which is
+    exactly what index_copy's backward did and costs the same.
+    """
+    @staticmethod
+    def forward(ctx, xf, gidx, pos, src, pad_idx):
+        ctx.save_for_backward(pos, src)
+        ctx.n_rows = xf.size(0)
+        xs = xf.index_select(0, gidx)
+        xs.index_fill_(0, pad_idx, 0) # pad rows enter the GEMM; they must be exactly zero
+        return xs
+
+    @staticmethod
+    def backward(ctx, g):
+        pos, src = ctx.saved_tensors
+        dxf = torch.zeros(ctx.n_rows, g.size(1), dtype=g.dtype, device=g.device)
+        dxf.index_add_(0, src, g.index_select(0, pos)) # only real slots contribute
+        return dxf, None, None, None, None
+
+
 class MoEMLP(nn.Module):
     """
     DeepSeek-V3-style MoE FFN: fine-grained routed experts + shared expert(s).
@@ -246,14 +276,27 @@ class MoEMLP(nn.Module):
         pos = pstart.gather(0, sorted_e) + within # padded slot of each sorted token
         src = torch.arange(N, device=xf.device).repeat_interleave(K)[order]
         P = N * K + 16 * self.n_experts # static upper bound on padded rows
-        # index_copy (not index_add): every padded slot `pos` is unique, so no
-        # accumulation is needed and the non-atomic scatter is faster.
-        xs = torch.zeros(P, C, device=xf.device, dtype=xf.dtype).index_copy(0, pos, xf[src])
+        # D1: permute by gathering through an index map instead of moving the
+        # activations three times. Pad slots and the unused tail point at row 0 and
+        # are zeroed after the gather (see _GatherPermute for the autograd subtlety).
+        # sum(pcounts) <= N*K + 15*E < P, so row P-1 is never inside any expert's
+        # block: it is a safe sink for the masked-off lanes of pad_idx.
+        gidx = torch.zeros(P, dtype=torch.long, device=xf.device)
+        gidx.index_copy_(0, pos, src)
+        r16 = torch.arange(16, device=xf.device)
+        pad_idx = torch.where(r16 < (pcounts - counts).unsqueeze(1),
+                              (pstart + counts).unsqueeze(1) + r16,
+                              torch.full_like(counts[:1], P - 1).unsqueeze(1))
+        xs = _GatherPermute.apply(xf, gidx, pos, src, pad_idx.reshape(-1))
         h = _GroupedMM.apply(xs, self.w_fc.to(xf.dtype), poffs)
         h = F.relu(h).square()
         out = _GroupedMM.apply(h, self.w_proj.to(xf.dtype), poffs)
-        y = torch.zeros_like(xf)
-        y.index_add_(0, src, out.index_select(0, pos) * gates.reshape(-1, 1).to(xf.dtype)[order])
+        # D2: gather back through the inverse permutation so each token's K expert
+        # outputs land adjacent, then reduce over K. Replaces a gather + an atomic
+        # index_add_ (and drops the gate permutation: gates is already in (N,K) order).
+        perm = torch.zeros(N * K, dtype=torch.long, device=xf.device)
+        perm.index_copy_(0, order, pos) # perm[n*K+k] = padded slot of pair (n, k)
+        y = (out.index_select(0, perm).view(N, K, C) * gates.unsqueeze(-1).to(xf.dtype)).sum(1)
         if self.shared_fc is not None:
             y = y + self.shared_proj(F.relu(self.shared_fc(xf)).square())
         return y.view(B, T, C)
