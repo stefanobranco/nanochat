@@ -57,7 +57,6 @@ def build(variant):
         # are remapped into range by the caller
         model.lm_head = torch.nn.Linear(cfg["n_embd"], 512, bias=False).to(device)
         model.config.vocab_size = 512
-    model = model.to(COMPUTE_DTYPE) if False else model
     model.train()
     return model
 
