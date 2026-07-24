@@ -103,8 +103,13 @@ def linear_cross_entropy(h, weight, targets, softcap=15.0, ignore_index=-1,
     if backend == "liger":
         fn = _try_liger()
         assert fn, "liger backend requested but liger_kernel is not importable"
-        # Liger applies the softcap internally and returns the mean loss.
-        return fn.apply(h, weight, targets, None, ignore_index, 0.0, "mean", softcap, False)
+        # Positional, against liger 0.8.1's signature:
+        #   (_input, weight, target, bias, ce_weight, ignore_index,
+        #    lse_square_scale, label_smoothing, reduction, softcap)
+        # Function.apply takes no kwargs, so the order has to be exact.
+        out = fn.apply(h, weight, targets, None, None, ignore_index,
+                       0.0, 0.0, "mean", softcap if softcap else None)
+        return out[0] if isinstance(out, tuple) else out
 
     if backend == "chunked":
         return _ChunkedLinearCE.apply(h, weight, targets, softcap, ignore_index, chunk)
