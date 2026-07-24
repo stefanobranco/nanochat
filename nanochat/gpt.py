@@ -734,7 +734,32 @@ class GPT(nn.Module):
             group["initial_lr"] = group["lr"]
         return optimizer
 
-    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean'):
+    def lm_head_logits(self, h):
+        """Project an already-normed hidden state to softcapped logits. DeepSeek-V3
+        shares this head between the trunk and every MTP depth, so it lives here
+        rather than as a closure inside forward()."""
+        softcap = 15 # smoothly cap the logits to the range [-softcap, softcap]
+        z = self.lm_head(h)[..., :self.config.vocab_size].float()
+        return softcap * torch.tanh(z / softcap)
+
+    @torch.inference_mode()
+    def mtp_step(self, h_prev, idx_ahead, kv_cache, depth=0):
+        """Run one MTP module at inference, mirroring the training recipe.
+
+        h_prev: (B, T, C) hidden from the previous depth (h^0 for depth 0) at
+        consecutive positions; idx_ahead: (B, T) the token one position ahead of
+        each. Returns (logits, h_k), where logits predict the token *two* ahead.
+        kv_cache is the MTP module's own cache and must be kept dense over token
+        positions so attention matches what the module saw during training.
+        """
+        T0, T = kv_cache.get_pos(), h_prev.size(1)
+        cos_sin = self.cos[:, T0:T0+T], self.sin[:, T0:T0+T]
+        emb_ahead = norm(self.transformer.wte(idx_ahead).to(h_prev.dtype))
+        hin = self.mtp_proj[depth](torch.cat([norm(h_prev), emb_ahead], dim=-1))
+        h_k = self.mtp_blocks[depth](hin, None, cos_sin, self.window_sizes[-1], kv_cache)
+        return self.lm_head_logits(norm(h_k)), h_k
+
+    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean', return_hidden=False):
         B, T = idx.size()
 
         # Grab the rotary embeddings for the current sequence length (they are of shape (1, seq_len, 1, head_dim/2))
@@ -761,9 +786,19 @@ class GPT(nn.Module):
             x_pre_smear = kv_cache.prev_embedding
             kv_cache.prev_embedding = x[:, -1:, :]
             if T > 1:
-                # Prefill: apply smear to positions 1+, same as training
+                # Chunk: smear positions 1+ against their in-chunk predecessor, same
+                # as training. Position 0 of the chunk has no in-chunk predecessor, so
+                # it smears against the cached embedding from the previous chunk (None
+                # only on a true prefill, where position 0 has no predecessor at all).
+                # Without this, a multi-token decode step diverges from a single-token
+                # one — which would silently corrupt speculative decoding.
                 gate = self.smear_lambda.to(x.dtype) * torch.sigmoid(self.smear_gate(x[:, 1:, :24]))
-                x = torch.cat([x[:, :1], x[:, 1:] + gate * x[:, :-1]], dim=1)
+                x_rest = x[:, 1:] + gate * x[:, :-1]
+                x_first = x[:, :1]
+                if x_pre_smear is not None:
+                    gate0 = self.smear_lambda.to(x.dtype) * torch.sigmoid(self.smear_gate(x[:, :1, :24]))
+                    x_first = x_first + gate0 * x_pre_smear
+                x = torch.cat([x_first, x_rest], dim=1)
             elif x_pre_smear is not None:
                 # Decode: single token, use cached prev embedding
                 gate = self.smear_lambda.to(x.dtype) * torch.sigmoid(self.smear_gate(x[:, :, :24]))
@@ -799,15 +834,13 @@ class GPT(nn.Module):
         h0 = norm(x) # main-model hidden feeding the shared head (= h^0 for MTP)
 
         # Forward the lm_head (compute logits)
-        softcap = 15 # smoothly cap the logits to the range [-softcap, softcap]
-        def shared_head(h): # norm already applied by caller; project, crop, softcap in fp32
-            z = self.lm_head(h)[..., :self.config.vocab_size].float()
-            return softcap * torch.tanh(z / softcap)
+        shared_head = self.lm_head_logits # norm already applied by caller
         logits = shared_head(h0) # (B, T, vocab_size)
 
         if targets is None:
-            # inference: just return the logits directly (MTP modules are unused)
-            return logits
+            # inference: just return the logits (MTP modules are unused for plain
+            # decoding; self-speculative decoding asks for h0 via return_hidden)
+            return (logits, h0) if return_hidden else logits
 
         loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
 
