@@ -45,6 +45,9 @@ class GPTConfig:
     moe_first_dense: int = 1 # keep this many initial layers dense
     router_bias_update_rate: float = 1e-3 # aux-loss-free balancing bias step size
     router_affinity: str = "sigmoid" # sigmoid (DSv3) | sqrtsoftplus (DSv4)
+    # mHC (DSv4 manifold-constrained hyper-connections). 1 = off (plain residual).
+    n_streams: int = 1
+    mhc_sinkhorn_iters: int = 5
 
 
 def norm(x):
@@ -249,6 +252,44 @@ class MoEMLP(nn.Module):
         return y.view(B, T, C)
 
 
+class MHCLayer(nn.Module):
+    """
+    One layer's manifold-constrained hyper-connection (DSv4 mHC, simplified).
+    Maintains n parallel residual streams. The n x n stream-mixing matrix is
+    projected onto (approximately) doubly stochastic matrices by Sinkhorn-Knopp,
+    so the residual transform is non-expansive. Logits are static + a per-token
+    input-dependent part (zero-init: training starts at the static point).
+    Per-token dynamics keep the mix causal - never pool over time here.
+    At init everything is uniform, streams stay identical, and the trunk is
+    exactly a plain residual network (replaces resid/x0 lambdas when active).
+    """
+    def __init__(self, config):
+        super().__init__()
+        n = config.n_streams
+        self.n = n
+        self.sinkhorn_iters = config.mhc_sinkhorn_iters
+        self.dyn_channels = 16
+        self.mix_logits = nn.Parameter(torch.zeros(n, n))
+        self.read_logits = nn.Parameter(torch.zeros(n))
+        self.write_gate = nn.Parameter(torch.ones(n))
+        self.dyn = Linear(self.dyn_channels, n * n, bias=False)
+
+    def forward(self, X, x_in):
+        # X: (B, T, n, C) streams; x_in: (B, T, C) the read vector (for the dynamic part)
+        B, T, _, C = X.size()
+        dyn_logits = self.dyn(x_in[..., :self.dyn_channels]).float() # (B, T, n*n)
+        logits = self.mix_logits.float().view(1, 1, self.n, self.n) + dyn_logits.view(B, T, self.n, self.n)
+        M = torch.exp(logits)
+        for _ in range(self.sinkhorn_iters): # fixed iteration count: compile-friendly, no data-dependent control flow
+            M = M / M.sum(dim=-1, keepdim=True)
+            M = M / M.sum(dim=-2, keepdim=True)
+        return torch.einsum('btij,btjc->btic', M.to(X.dtype), X)
+
+    def read(self, X):
+        r = F.softmax(self.read_logits.float(), dim=0).to(X.dtype)
+        return torch.einsum('btnc,n->btc', X, r)
+
+
 class Block(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
@@ -299,6 +340,9 @@ class GPT(nn.Module):
         head_dim = config.n_embd // config.n_head
         kv_dim = config.n_kv_head * head_dim
         self.value_embeds = nn.ModuleDict({str(i): nn.Embedding(padded_vocab_size, kv_dim) for i in range(config.n_layer) if has_ve(i, config.n_layer)})
+        # mHC: per-layer stream mixers + final read-out (replaces resid/x0 lambdas when active)
+        self.mhc = nn.ModuleList([MHCLayer(config) for _ in range(config.n_layer)]) if config.n_streams > 1 else None
+        self.final_read_logits = nn.Parameter(torch.zeros(config.n_streams)) if config.n_streams > 1 else None
         # To support meta device initialization, we init the rotary embeddings here, but it's just "fake" meta tensors only.
         # As for rotary_seq_len, these rotary embeddings are pretty small/cheap in memory,
         # so let's just over-compute them by 10X, but assert fail if we ever reach that amount.
@@ -371,6 +415,15 @@ class GPT(nn.Module):
         for block in self.transformer.h:
             if block.attn.ve_gate is not None:
                 torch.nn.init.uniform_(block.attn.ve_gate.weight, 0.0, 0.02)
+
+        # mHC: uniform mixing/read, unit write, zero dynamics => exactly a plain residual net at init
+        if self.mhc is not None:
+            for layer in self.mhc:
+                torch.nn.init.zeros_(layer.mix_logits)
+                torch.nn.init.zeros_(layer.read_logits)
+                torch.nn.init.ones_(layer.write_gate)
+                torch.nn.init.zeros_(layer.dyn.weight)
+            torch.nn.init.zeros_(self.final_read_logits)
 
         # Rotary embeddings
         head_dim = self.config.n_embd // self.config.n_head
@@ -529,6 +582,8 @@ class GPT(nn.Module):
         lm_head = sum(p.numel() for p in self.lm_head.parameters())
         transformer_matrices = sum(p.numel() for p in self.transformer.h.parameters())
         scalars = self.resid_lambdas.numel() + self.x0_lambdas.numel() + self.smear_gate.weight.numel() + self.smear_lambda.numel() + self.backout_lambda.numel()
+        if self.mhc is not None:
+            scalars += sum(p.numel() for p in self.mhc.parameters()) + self.final_read_logits.numel()
         total = wte + value_embeds + lm_head + transformer_matrices + scalars
         assert total == sum(p.numel() for p in self.parameters()), "Parameter count mismatch"
         return {
@@ -553,7 +608,8 @@ class GPT(nn.Module):
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
         smear_params = [self.smear_gate.weight, self.smear_lambda, self.backout_lambda]
-        assert len(list(self.parameters())) == len(matrix_params) + len(router_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params) + len(smear_params)
+        mhc_params = (list(self.mhc.parameters()) + [self.final_read_logits]) if self.mhc is not None else []
+        assert len(list(self.parameters())) == len(matrix_params) + len(router_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params) + len(smear_params) + len(mhc_params)
 
         # Scale the LR for the AdamW parameters by ∝1/√dmodel (tuned for 768 dim model)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
@@ -571,6 +627,9 @@ class GPT(nn.Module):
         ]
         if router_params:
             param_groups.append(dict(kind='adamw', params=router_params, lr=unembedding_lr * dmodel_lr_scale, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0))
+        if mhc_params:
+            # conservative lr: the mixing matrix steers every residual in the network
+            param_groups.append(dict(kind='adamw', params=mhc_params, lr=0.02, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0))
         # Muon groups (matrix params, grouped by shape for stacking)
         for shape in sorted({p.shape for p in matrix_params}):
             group_params = [p for p in matrix_params if p.shape == shape]
@@ -624,12 +683,25 @@ class GPT(nn.Module):
         n_layer = self.config.n_layer
         backout_layer = n_layer // 2  # cache at halfway point
         x_backout = None
-        for i, block in enumerate(self.transformer.h):
-            x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
-            ve = self.value_embeds[str(i)](idx).to(x.dtype) if str(i) in self.value_embeds else None
-            x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
-            if i == backout_layer:
-                x_backout = x
+        if self.mhc is not None:
+            # mHC trunk: n parallel streams, doubly-stochastic mixing per layer.
+            # Replaces the resid/x0 lambda machinery (mixing subsumes both roles).
+            X = x.unsqueeze(2).expand(-1, -1, self.config.n_streams, -1).contiguous()
+            for i, block in enumerate(self.transformer.h):
+                x_in = self.mhc[i].read(X)
+                ve = self.value_embeds[str(i)](idx).to(x.dtype) if str(i) in self.value_embeds else None
+                y = block(x_in, ve, cos_sin, self.window_sizes[i], kv_cache) - x_in # block adds x_in internally; extract the delta
+                X = self.mhc[i](X, x_in) + self.mhc[i].write_gate.to(X.dtype).view(1, 1, -1, 1) * y.unsqueeze(2)
+                if i == backout_layer:
+                    x_backout = X.mean(dim=2)
+            x = torch.einsum('btnc,n->btc', X, F.softmax(self.final_read_logits.float(), dim=0).to(X.dtype))
+        else:
+            for i, block in enumerate(self.transformer.h):
+                x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
+                ve = self.value_embeds[str(i)](idx).to(x.dtype) if str(i) in self.value_embeds else None
+                x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
+                if i == backout_layer:
+                    x_backout = x
         # Subtract mid-layer residual to remove low-level features before logit projection
         if x_backout is not None:
             x = x - self.backout_lambda.to(x.dtype) * x_backout

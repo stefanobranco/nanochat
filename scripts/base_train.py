@@ -60,6 +60,7 @@ parser.add_argument("--n-shared", type=int, default=1, help="always-on shared ex
 parser.add_argument("--expert-hidden", type=int, default=0, help="hidden dim per expert (0 = model dim)")
 parser.add_argument("--moe-first-dense", type=int, default=1, help="keep this many initial layers dense")
 parser.add_argument("--router-affinity", type=str, default="sigmoid", choices=["sigmoid", "sqrtsoftplus"], help="routing affinity function (DSv3 sigmoid / DSv4 sqrt-softplus)")
+parser.add_argument("--n-streams", type=int, default=1, help="mHC residual streams (DSv4); 1 = plain residual")
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
 parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
@@ -147,7 +148,7 @@ def build_model_meta(depth):
         window_pattern=args.window_pattern,
         n_experts=args.n_experts, n_topk=args.n_topk, n_shared=args.n_shared,
         expert_hidden=args.expert_hidden, moe_first_dense=args.moe_first_dense,
-        router_affinity=args.router_affinity,
+        router_affinity=args.router_affinity, n_streams=args.n_streams,
     )
     with torch.device("meta"):
         model_meta = GPT(config)
