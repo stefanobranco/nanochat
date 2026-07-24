@@ -61,6 +61,8 @@ parser.add_argument("--expert-hidden", type=int, default=0, help="hidden dim per
 parser.add_argument("--moe-first-dense", type=int, default=1, help="keep this many initial layers dense")
 parser.add_argument("--router-affinity", type=str, default="sigmoid", choices=["sigmoid", "sqrtsoftplus"], help="routing affinity function (DSv3 sigmoid / DSv4 sqrt-softplus)")
 parser.add_argument("--n-streams", type=int, default=1, help="mHC residual streams (DSv4); 1 = plain residual")
+parser.add_argument("--n-mtp", type=int, default=0, help="MTP depth (DSv3 multi-token prediction); 0 = off")
+parser.add_argument("--mtp-weight", type=float, default=0.3, help="MTP auxiliary loss weight")
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
 parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
@@ -149,6 +151,7 @@ def build_model_meta(depth):
         n_experts=args.n_experts, n_topk=args.n_topk, n_shared=args.n_shared,
         expert_hidden=args.expert_hidden, moe_first_dense=args.moe_first_dense,
         router_affinity=args.router_affinity, n_streams=args.n_streams,
+        n_mtp=args.n_mtp, mtp_weight=args.mtp_weight,
     )
     with torch.device("meta"):
         model_meta = GPT(config)

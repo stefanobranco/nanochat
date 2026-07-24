@@ -48,6 +48,10 @@ class GPTConfig:
     # mHC (DSv4 manifold-constrained hyper-connections). 1 = off (plain residual).
     n_streams: int = 1
     mhc_sinkhorn_iters: int = 5
+    # MTP (DeepSeek-V3 multi-token prediction). 0 = off. Sequential modules, each
+    # a transformer block + projection, sharing wte + lm_head. Training-only aux loss.
+    n_mtp: int = 0
+    mtp_weight: float = 0.3
 
 
 def norm(x):
@@ -356,6 +360,16 @@ class GPT(nn.Module):
         # mHC: per-layer stream mixers + final read-out (replaces resid/x0 lambdas when active)
         self.mhc = nn.ModuleList([MHCLayer(config) for _ in range(config.n_layer)]) if config.n_streams > 1 else None
         self.final_read_logits = nn.Parameter(torch.zeros(config.n_streams)) if config.n_streams > 1 else None
+        # MTP (DeepSeek-V3): sequential modules predicting t+2, t+3, ... Each module is a
+        # transformer block (layer_idx=n_layer => no value-embedding gate) plus a projection
+        # combining the previous depth's hidden with the look-ahead token embedding. wte and
+        # lm_head are shared with the main model (not re-created here).
+        if config.n_mtp > 0:
+            self.mtp_blocks = nn.ModuleList([Block(config, config.n_layer) for _ in range(config.n_mtp)])
+            self.mtp_proj = nn.ModuleList([Linear(2 * config.n_embd, config.n_embd, bias=False) for _ in range(config.n_mtp)])
+        else:
+            self.mtp_blocks = None
+            self.mtp_proj = None
         # To support meta device initialization, we init the rotary embeddings here, but it's just "fake" meta tensors only.
         # As for rotary_seq_len, these rotary embeddings are pretty small/cheap in memory,
         # so let's just over-compute them by 10X, but assert fail if we ever reach that amount.
@@ -389,7 +403,10 @@ class GPT(nn.Module):
         # Transformer blocks: uniform init with bound = sqrt(3) * std (same standard deviation as normal)
         n_embd = self.config.n_embd
         s = 3**0.5 * n_embd**-0.5 # sqrt(3) multiplier makes sure Uniform achieves the same std as Normal
-        for block in self.transformer.h:
+        init_blocks = list(self.transformer.h)
+        if self.mtp_blocks is not None:
+            init_blocks += list(self.mtp_blocks) # MTP blocks init identically to trunk blocks
+        for block in init_blocks:
             torch.nn.init.uniform_(block.attn.c_q.weight, -s, s) # weights use Uniform to avoid outliers
             torch.nn.init.uniform_(block.attn.c_k.weight, -s, s)
             torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
@@ -405,6 +422,10 @@ class GPT(nn.Module):
             else:
                 torch.nn.init.uniform_(block.mlp.c_fc.weight, -s * 0.4, s * 0.4)  # 0.4x init scale for c_fc
                 torch.nn.init.zeros_(block.mlp.c_proj.weight)
+        # MTP projection matrices M_k (concat of two normed d-vectors -> d)
+        if self.mtp_proj is not None:
+            for proj in self.mtp_proj:
+                torch.nn.init.uniform_(proj.weight, -s * 0.4, s * 0.4)
 
         # Per-layer scalars
         # Per-layer resid init: stronger residual at early layers, weaker at deep layers
@@ -530,8 +551,16 @@ class GPT(nn.Module):
         (embeddings = lookups, per-layer scalars) are nn.Embedding or raw Parameters.
         For MoE, only the top-k routed experts touch each token, so inactive expert
         params are excluded (this is a FLOPs count, not a storage count).
+        MTP modules are excluded: they run in training only and are discarded at
+        inference, so this count reflects the deployed model. (Consequence: on MTP
+        runs, per-step MFU under-reads, since real training FLOPs include the MTP
+        blocks but this estimate does not.)
         """
-        matmul_params = sum(m.weight.numel() for m in self.modules() if isinstance(m, Linear))
+        mtp_ids = set()
+        if self.mtp_blocks is not None:
+            for m in list(self.mtp_blocks.modules()) + list(self.mtp_proj.modules()):
+                mtp_ids.add(id(m))
+        matmul_params = sum(m.weight.numel() for m in self.modules() if isinstance(m, Linear) and id(m) not in mtp_ids)
         for block in self.transformer.h:
             if isinstance(block.mlp, MoEMLP):
                 expert_params = block.mlp.w_fc.numel() + block.mlp.w_proj.numel() # not Linears: add active fraction
@@ -594,16 +623,20 @@ class GPT(nn.Module):
         value_embeds = sum(p.numel() for p in self.value_embeds.parameters())
         lm_head = sum(p.numel() for p in self.lm_head.parameters())
         transformer_matrices = sum(p.numel() for p in self.transformer.h.parameters())
+        mtp = 0
+        if self.mtp_blocks is not None:
+            mtp = sum(p.numel() for p in self.mtp_blocks.parameters()) + sum(p.numel() for p in self.mtp_proj.parameters())
         scalars = self.resid_lambdas.numel() + self.x0_lambdas.numel() + self.smear_gate.weight.numel() + self.smear_lambda.numel() + self.backout_lambda.numel()
         if self.mhc is not None:
             scalars += sum(p.numel() for p in self.mhc.parameters()) + self.final_read_logits.numel()
-        total = wte + value_embeds + lm_head + transformer_matrices + scalars
+        total = wte + value_embeds + lm_head + transformer_matrices + mtp + scalars
         assert total == sum(p.numel() for p in self.parameters()), "Parameter count mismatch"
         return {
             'wte': wte,
             'value_embeds': value_embeds,
             'lm_head': lm_head,
             'transformer_matrices': transformer_matrices,
+            'mtp': mtp,
             'scalars': scalars,
             'total': total,
         }
@@ -612,9 +645,13 @@ class GPT(nn.Module):
         model_dim = self.config.n_embd
 
         # Separate out all parameters into groups
-        # MoE routers go to AdamW, not Muon: orthogonalizing a routing matrix distorts the affinities
-        router_params = [p for n, p in self.transformer.h.named_parameters() if "router" in n]
-        matrix_params = [p for n, p in self.transformer.h.named_parameters() if "router" not in n]
+        # MoE routers go to AdamW, not Muon: orthogonalizing a routing matrix distorts the affinities.
+        # MTP blocks/projections are ordinary matrices and get the same treatment as trunk blocks.
+        block_named = list(self.transformer.h.named_parameters())
+        if self.mtp_blocks is not None:
+            block_named += list(self.mtp_blocks.named_parameters()) + list(self.mtp_proj.named_parameters())
+        router_params = [p for n, p in block_named if "router" in n]
+        matrix_params = [p for n, p in block_named if "router" not in n]
         value_embeds_params = list(self.value_embeds.parameters())
         embedding_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
@@ -724,23 +761,41 @@ class GPT(nn.Module):
         # Subtract mid-layer residual to remove low-level features before logit projection
         if x_backout is not None:
             x = x - self.backout_lambda.to(x.dtype) * x_backout
-        x = norm(x)
+        h0 = norm(x) # main-model hidden feeding the shared head (= h^0 for MTP)
 
         # Forward the lm_head (compute logits)
         softcap = 15 # smoothly cap the logits to the range [-softcap, softcap]
-        logits = self.lm_head(x) # (B, T, padded_vocab_size) <- very big tensor, large amount of memory
-        logits = logits[..., :self.config.vocab_size] # slice to remove padding
-        logits = logits.float() # switch to fp32 for logit softcap and loss computation
-        logits = softcap * torch.tanh(logits / softcap) # squash the logits
+        def shared_head(h): # norm already applied by caller; project, crop, softcap in fp32
+            z = self.lm_head(h)[..., :self.config.vocab_size].float()
+            return softcap * torch.tanh(z / softcap)
+        logits = shared_head(h0) # (B, T, vocab_size)
 
-        if targets is not None:
-            # training: given the targets, compute and return the loss
-            # TODO experiment with chunked cross-entropy?
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
-            return loss
-        else:
-            # inference: just return the logits directly
+        if targets is None:
+            # inference: just return the logits directly (MTP modules are unused)
             return logits
+
+        loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
+
+        # Multi-Token Prediction (DeepSeek-V3): sequential modules predict t+2, t+3, ...
+        # Each depth k combines the previous depth's hidden with the embedding of the
+        # token k ahead, runs a transformer block, and predicts the token k+1 ahead via
+        # the shared head. Training-only auxiliary loss; excluded from bpb eval (which
+        # runs under model.eval() with reduction='none').
+        if self.mtp_blocks is not None and self.training and loss_reduction == 'mean':
+            mtp_losses = []
+            h_prev = h0
+            emb = norm(self.transformer.wte(idx).to(h0.dtype))               # Emb(t_i), shared across depths
+            for k in range(1, self.config.n_mtp + 1):
+                emb_ahead = F.pad(emb[:, k:], (0, 0, 0, k))                    # Emb(t_{i+k}), tail zero-padded
+                hin = self.mtp_proj[k-1](torch.cat([norm(h_prev), emb_ahead], dim=-1))
+                h_k = self.mtp_blocks[k-1](hin, None, cos_sin, self.window_sizes[-1], None)
+                logits_k = shared_head(norm(h_k))
+                tgt_k = F.pad(targets[:, k:], (0, k), value=-1)               # predict t_{i+k+1}
+                mtp_losses.append(F.cross_entropy(logits_k.reshape(-1, logits_k.size(-1)), tgt_k.reshape(-1), ignore_index=-1))
+                h_prev = h_k
+            loss = loss + self.config.mtp_weight * torch.stack(mtp_losses).mean()
+
+        return loss
 
     @torch.inference_mode()
     def generate(self, tokens, max_tokens, temperature=1.0, top_k=None, seed=42):
