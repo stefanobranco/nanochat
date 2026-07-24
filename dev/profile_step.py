@@ -25,7 +25,7 @@ import time
 import torch
 
 from nanochat.common import COMPUTE_DTYPE
-from nanochat.gpt import GPT, GPTConfig
+from nanochat.gpt import GPT, GPTConfig, Linear
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--device-batch-size", type=int, default=16)
@@ -55,7 +55,9 @@ def build(variant):
     if variant == "cheap_head":
         # shrink the vocab projection but keep everything else identical; targets
         # are remapped into range by the caller
-        model.lm_head = torch.nn.Linear(cfg["n_embd"], 512, bias=False).to(device)
+        # nanochat's Linear, not torch's: it casts the fp32 master weight to the
+        # activation dtype, which a plain nn.Linear would not do
+        model.lm_head = Linear(cfg["n_embd"], 512, bias=False).to(device)
         model.config.vocab_size = 512
     model.train()
     return model
