@@ -254,7 +254,20 @@ class MoEMLP(nn.Module):
 
 class MHCLayer(nn.Module):
     """
-    One layer's manifold-constrained hyper-connection (DSv4 mHC, simplified).
+    One layer's manifold-constrained hyper-connection (DSv4 mHC).
+
+    ⚠️ REDUCED IMPLEMENTATION — NOT a faithful reproduction. The A3 run using
+    this (2026-07-24) is VOID as a test of mHC/hyper-connections; see
+    DESIGN.md "METHODOLOGY RULE". Differences from the source design
+    (Hyper-Connections, arXiv 2409.19606; DSv4 mHC):
+      - single softmax read + single dynamic mixing term (source: separate
+        depth-connection and width-connection matrices, per-stream learnable scales)
+      - typically run at n=2 here; source's headline gains are at n=4
+      - replaces nanochat's tuned resid/x0 lambdas, so the baseline is already
+        enhanced (source compares against a *plain* residual)
+    Before trusting any result from this module, implement DHC faithfully and
+    compare against a plain-residual baseline.
+
     Maintains n parallel residual streams. The n x n stream-mixing matrix is
     projected onto (approximately) doubly stochastic matrices by Sinkhorn-Knopp,
     so the residual transform is non-expansive. Logits are static + a per-token
