@@ -245,7 +245,9 @@ class MoEMLP(nn.Module):
         pos = pstart.gather(0, sorted_e) + within # padded slot of each sorted token
         src = torch.arange(N, device=xf.device).repeat_interleave(K)[order]
         P = N * K + 16 * self.n_experts # static upper bound on padded rows
-        xs = torch.zeros(P, C, device=xf.device, dtype=xf.dtype).index_add(0, pos, xf[src])
+        # index_copy (not index_add): every padded slot `pos` is unique, so no
+        # accumulation is needed and the non-atomic scatter is faster.
+        xs = torch.zeros(P, C, device=xf.device, dtype=xf.dtype).index_copy(0, pos, xf[src])
         h = _GroupedMM.apply(xs, self.w_fc.to(xf.dtype), poffs)
         h = F.relu(h).square()
         out = _GroupedMM.apply(h, self.w_proj.to(xf.dtype), poffs)
