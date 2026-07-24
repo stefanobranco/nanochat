@@ -83,6 +83,7 @@ parser.add_argument("--resume-from-step", type=int, default=-1, help="resume tra
 # Evaluation
 parser.add_argument("--eval-every", type=int, default=250, help="evaluate val bpb every N steps (-1 = disable)")
 parser.add_argument("--eval-tokens", type=int, default=80*524288, help="number of tokens to evaluate val loss on")
+parser.add_argument("--eval-tokens-intermediate", type=int, default=None, help="tokens for mid-run val evals (default: same as --eval-tokens). The final eval always uses --eval-tokens, so lowering this trades curve smoothness for wall clock without touching the reported metric")
 parser.add_argument("--core-metric-every", type=int, default=2000, help="evaluate CORE metric every N steps (-1 = disable)")
 parser.add_argument("--core-metric-max-per-task", type=int, default=500, help="examples per task for CORE metric")
 parser.add_argument("--sample-every", type=int, default=2000, help="sample from model every N steps (-1 = disable)")
@@ -438,7 +439,10 @@ while True:
     if args.eval_every > 0 and (last_step or step % args.eval_every == 0):
         model.eval()
         val_loader = build_val_loader()
-        eval_steps = args.eval_tokens // (args.device_batch_size * args.max_seq_len * ddp_world_size)
+        # Mid-run evals only draw a curve; the final one produces the number the
+        # experiment is judged on, so it always uses the full --eval-tokens.
+        eval_tokens = args.eval_tokens if (last_step or args.eval_tokens_intermediate is None) else args.eval_tokens_intermediate
+        eval_steps = eval_tokens // (args.device_batch_size * args.max_seq_len * ddp_world_size)
         with disable_fp8(model):
             val_bpb = evaluate_bpb(model, val_loader, eval_steps, token_bytes)
         print0(f"Step {step:05d} | Validation bpb: {val_bpb:.6f}")
