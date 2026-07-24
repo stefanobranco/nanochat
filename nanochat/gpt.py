@@ -48,6 +48,9 @@ class GPTConfig:
     # mHC (DSv4 manifold-constrained hyper-connections). 1 = off (plain residual).
     n_streams: int = 1
     mhc_sinkhorn_iters: int = 5
+    # AttnRes (Kimi, arXiv 2603.15031). Full variant: softmax attention over every
+    # earlier sublayer output, replacing the residual stream. Competes with mHC.
+    attn_res: bool = False
     # MTP (DeepSeek-V3 multi-token prediction). 0 = off. Sequential modules, each
     # a transformer block + projection, sharing wte + lm_head. Training-only aux loss.
     n_mtp: int = 0
@@ -342,12 +345,62 @@ class MHCLayer(nn.Module):
         return torch.einsum('btnc,n->btc', X, r)
 
 
+class AttnRes(nn.Module):
+    """Attention Residuals (Kimi Team, arXiv 2603.15031), Full variant.
+
+    Replaces `h_l = h_{l-1} + f_{l-1}(h_{l-1})` with a softmax attention over the
+    outputs of every earlier sublayer:
+
+        h_l = sum_i alpha_{i->l} * v_i,  alpha = softmax_i( q_l . RMSNorm(k_i) )
+        k_i = v_i = f_i(h_i)  (v_0 = the token embedding)
+
+    One instance per *sublayer* (attention and MLP each get their own), so a
+    d-layer model has 2d + 1 of these counting the final aggregation.
+
+    Two details the paper is emphatic about, both easy to get wrong:
+    - the pseudo-query is initialized to ZERO, so at init every source gets equal
+      weight and the layer starts as a plain average (they report this prevents
+      training volatility);
+    - RMSNorm applies to the key path only. The values are summed un-normalized,
+      which is what stops large-magnitude layers from dominating the weights
+      without also rescaling their contribution.
+
+    The paper's per-layer RMSNorm carries a learnable gain. We use nanochat's
+    parameterless norm instead, which is equivalent rather than a simplification:
+    a diagonal gain g would appear only as q.(g * RMSNorm(k)) = (q * g).RMSNorm(k),
+    i.e. absorbed into the pseudo-query we are already learning.
+    """
+    def __init__(self, config):
+        super().__init__()
+        self.q = nn.Parameter(torch.zeros(config.n_embd)) # zero-init is load-bearing
+
+    def forward(self, sources):
+        q = self.q.to(sources[0].dtype)
+        # Score each source separately rather than stacking: a stacked (S,B,T,C)
+        # buffer would be ~1GB per call at d12/bs16, and only the (S,B,T) scores
+        # are actually needed at full width.
+        logits = torch.stack([(norm(v) * q).sum(-1) for v in sources], dim=0).float()
+        w = logits.softmax(dim=0).to(sources[0].dtype) # softmax over the depth axis
+        out = w[0].unsqueeze(-1) * sources[0]
+        for i in range(1, len(sources)):
+            out = out + w[i].unsqueeze(-1) * sources[i]
+        return out
+
+
 class Block(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
         self.attn = CausalSelfAttention(config, layer_idx)
         use_moe = config.n_experts > 0 and layer_idx >= config.moe_first_dense
         self.mlp = MoEMLP(config) if use_moe else MLP(config)
+
+    # AttnRes needs the sublayer outputs on their own (it supplies its own
+    # cross-layer mixing in place of the residual adds below).
+    def attn_out(self, x, ve, cos_sin, window_size, kv_cache):
+        return self.attn(norm(x), ve, cos_sin, window_size, kv_cache)
+
+    def mlp_out(self, x):
+        return self.mlp(norm(x))
 
     def forward(self, x, ve, cos_sin, window_size, kv_cache):
         x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache)
@@ -395,6 +448,10 @@ class GPT(nn.Module):
         # mHC: per-layer stream mixers + final read-out (replaces resid/x0 lambdas when active)
         self.mhc = nn.ModuleList([MHCLayer(config) for _ in range(config.n_layer)]) if config.n_streams > 1 else None
         self.final_read_logits = nn.Parameter(torch.zeros(config.n_streams)) if config.n_streams > 1 else None
+        # 2 per block (before attention, before MLP) + 1 for the final aggregation,
+        # which the paper specifies also reads all sources rather than just the last.
+        assert not (config.attn_res and config.n_streams > 1), "AttnRes and mHC both replace the residual stream"
+        self.attn_res = nn.ModuleList([AttnRes(config) for _ in range(2 * config.n_layer + 1)]) if config.attn_res else None
         # MTP (DeepSeek-V3): sequential modules predicting t+2, t+3, ... Each module is a
         # transformer block (layer_idx=n_layer => no value-embedding gate) plus a projection
         # combining the previous depth's hidden with the look-ahead token embedding. wte and
@@ -694,7 +751,8 @@ class GPT(nn.Module):
         x0_params = [self.x0_lambdas]
         smear_params = [self.smear_gate.weight, self.smear_lambda, self.backout_lambda]
         mhc_params = (list(self.mhc.parameters()) + [self.final_read_logits]) if self.mhc is not None else []
-        assert len(list(self.parameters())) == len(matrix_params) + len(router_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params) + len(smear_params) + len(mhc_params)
+        attn_res_params = list(self.attn_res.parameters()) if self.attn_res is not None else []
+        assert len(list(self.parameters())) == len(matrix_params) + len(router_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params) + len(smear_params) + len(mhc_params) + len(attn_res_params)
 
         # Scale the LR for the AdamW parameters by ∝1/√dmodel (tuned for 768 dim model)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
@@ -708,12 +766,13 @@ class GPT(nn.Module):
             dict(kind='adamw', params=value_embeds_params, lr=embedding_lr * dmodel_lr_scale * 0.5, betas=(0.8, 0.995), eps=1e-10, weight_decay=0.01),
             dict(kind='adamw', params=smear_params, lr=0.2, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0),
         ]
-        if self.mhc is None:
+        if self.mhc is None and self.attn_res is None:
             param_groups.append(dict(kind='adamw', params=resid_params, lr=scalar_lr * 0.01, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.05))
             param_groups.append(dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0))  # higher beta1 for x0
         else:
-            # mHC replaces the resid/x0 machinery: those params are unused in forward,
-            # would get grad=None, and the fused AdamW step cannot handle that. Freeze them.
+            # mHC and AttnRes both replace the resid/x0 machinery: those params are
+            # unused in forward, would get grad=None, and the fused AdamW step cannot
+            # handle that. Freeze them.
             for p in resid_params + x0_params:
                 p.requires_grad_(False)
         if router_params:
@@ -721,6 +780,11 @@ class GPT(nn.Module):
         if mhc_params:
             # conservative lr: the mixing matrix steers every residual in the network
             param_groups.append(dict(kind='adamw', params=mhc_params, lr=0.02, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0))
+        if attn_res_params:
+            # pseudo-queries: d-vectors, not matrices, so AdamW rather than Muon
+            # (orthogonalizing a vector is meaningless). No weight decay — decaying
+            # them back toward zero would pin the layer at a uniform average.
+            param_groups.append(dict(kind='adamw', params=attn_res_params, lr=scalar_lr * 0.04, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0))
         # Muon groups (matrix params, grouped by shape for stacking)
         for shape in sorted({p.shape for p in matrix_params}):
             group_params = [p for p in matrix_params if p.shape == shape]
@@ -822,6 +886,18 @@ class GPT(nn.Module):
                 if i == backout_layer:
                     x_backout = X.mean(dim=2)
             x = torch.einsum('btnc,n->btc', X, F.softmax(self.final_read_logits.float(), dim=0).to(X.dtype))
+        elif self.attn_res is not None:
+            # AttnRes trunk: no running residual. Every sublayer reads a softmax
+            # mixture of all previous sublayer outputs, starting from the embedding.
+            sources = [x0]
+            for i, block in enumerate(self.transformer.h):
+                ve = self.value_embeds[str(i)](idx).to(x.dtype) if str(i) in self.value_embeds else None
+                h = self.attn_res[2 * i](sources)
+                if i == backout_layer + 1:
+                    x_backout = h # the state entering this block == the state after backout_layer
+                sources.append(block.attn_out(h, ve, cos_sin, self.window_sizes[i], kv_cache))
+                sources.append(block.mlp_out(self.attn_res[2 * i + 1](sources)))
+            x = self.attn_res[-1](sources)
         else:
             for i, block in enumerate(self.transformer.h):
                 x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
