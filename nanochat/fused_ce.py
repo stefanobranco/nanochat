@@ -40,6 +40,25 @@ def _try_liger():
     return _LIGER
 
 
+@torch.compiler.disable
+def _liger_call(h, weight, targets, softcap, ignore_index):
+    """Liger's fused kernel, kept out of the compiled region.
+
+    Its forward does `target_mask.sum().item()`, a data-dependent GPU sync that
+    dynamo cannot trace; letting inductor see it fails compilation outright.
+
+    Positional, against liger 0.8.1's signature:
+      (_input, weight, target, bias, ce_weight, ignore_index,
+       lse_square_scale, label_smoothing, reduction, softcap)
+    Function.apply takes no kwargs, so the order has to be exact.
+    """
+    fn = _try_liger()
+    assert fn, "liger backend requested but liger_kernel is not importable"
+    out = fn.apply(h, weight, targets, None, None, ignore_index,
+                   0.0, 0.0, "mean", softcap if softcap else None)
+    return out[0] if isinstance(out, tuple) else out
+
+
 class _ChunkedLinearCE(torch.autograd.Function):
     """Cross-entropy over a linear projection, chunked over tokens.
 
@@ -101,15 +120,7 @@ def linear_cross_entropy(h, weight, targets, softcap=15.0, ignore_index=-1,
         backend = "liger" if _try_liger() else "chunked"
 
     if backend == "liger":
-        fn = _try_liger()
-        assert fn, "liger backend requested but liger_kernel is not importable"
-        # Positional, against liger 0.8.1's signature:
-        #   (_input, weight, target, bias, ce_weight, ignore_index,
-        #    lse_square_scale, label_smoothing, reduction, softcap)
-        # Function.apply takes no kwargs, so the order has to be exact.
-        out = fn.apply(h, weight, targets, None, None, ignore_index,
-                       0.0, 0.0, "mean", softcap if softcap else None)
-        return out[0] if isinstance(out, tuple) else out
+        return _liger_call(h, weight, targets, softcap, ignore_index)
 
     if backend == "chunked":
         return _ChunkedLinearCE.apply(h, weight, targets, softcap, ignore_index, chunk)
