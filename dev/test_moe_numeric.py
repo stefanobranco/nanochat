@@ -18,6 +18,7 @@ m = m.to(torch.bfloat16); m.route_bias.zero_(); m.eval()
 x = torch.randn(2, 16, 64, device="cuda", dtype=torch.bfloat16, requires_grad=True)
 y = m(x); y.sum().backward()
 g_grouped = m.w_fc.grad.float().clone()
+gx_grouped = x.grad.float().clone() # dx matters: _GatherPermute hand-writes this backward
 
 def ref(dtype):
     wfc = m.w_fc.detach().to(dtype).requires_grad_(True)
@@ -33,13 +34,16 @@ def ref(dtype):
             h = torch.relu(xf[t] @ wfc[e]).square()
             yy = yy.index_add(0, torch.tensor([t], device="cuda"), ((h @ wpr[e]) * gates[t, j].to(dtype)).unsqueeze(0))
     yy.sum().backward()
-    return wfc.grad.float()
+    return wfc.grad.float(), xf.grad.float().view(2, 16, 64)
 
-g32 = ref(torch.float32)
-g16 = ref(torch.bfloat16)
+g32, gx32 = ref(torch.float32)
+g16, gx16 = ref(torch.bfloat16)
 rel = lambda a, b: ((a - b).norm() / b.norm()).item()
-e_grouped = rel(g_grouped, g32)
-e_bf16ref = rel(g16, g32)
-print(f"grouped vs fp32-ref rel err: {e_grouped:.5f}")
-print(f"bf16-ref vs fp32-ref rel err: {e_bf16ref:.5f}")
-print("PASS" if e_grouped < 2 * e_bf16ref else "FAIL — grouped error exceeds dtype noise")
+ok = True
+for name, ours, r32, r16 in (("dW", g_grouped, g32, g16), ("dX", gx_grouped, gx32, gx16)):
+    e_ours, e_ref = rel(ours, r32), rel(r16, r32)
+    passed = e_ours < 2 * e_ref + 1e-6
+    ok &= passed
+    print(f"{name}: ours vs fp32-ref {e_ours:.5f} | bf16-ref vs fp32-ref {e_ref:.5f} "
+          f"{'ok' if passed else 'FAIL'}")
+print("PASS" if ok else "FAIL — error exceeds dtype noise")
