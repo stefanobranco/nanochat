@@ -269,7 +269,12 @@ class MoEMLP(nn.Module):
         flat_topi = topi.reshape(-1) # (N*K)
         order = flat_topi.argsort()
         sorted_e = flat_topi[order]
-        counts = torch.bincount(flat_topi, minlength=self.n_experts)
+        # scatter_add into a fixed buffer rather than bincount: bincount's output
+        # shape is data-dependent, so dynamo cannot trace it and gives up on the
+        # whole MoE forward ("Skipping the function and falling back to eager").
+        # We already know the size is n_experts, so nothing here is actually dynamic.
+        counts = torch.zeros(self.n_experts, dtype=torch.long, device=xf.device)
+        counts.scatter_add_(0, flat_topi, torch.ones_like(flat_topi))
         pcounts = ((counts + 15) // 16) * 16
         poffs = pcounts.cumsum(0).to(torch.int32)
         cum0 = counts.cumsum(0) - counts # start of each expert's block in sorted order
