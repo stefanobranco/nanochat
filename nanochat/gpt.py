@@ -179,6 +179,11 @@ class _GatherPermute(torch.autograd.Function):
     tail of its dx output uninitialized, so that garbage would land in xf. We supply
     the backward ourselves, restricted to the real (pos -> src) pairs, which is
     exactly what index_copy's backward did and costs the same.
+
+    That hazard is measured, not theoretical: running F.grouped_mm with offsets that
+    stop short of the tensor and inspecting dx beyond offs[-1] gives all-zeros on a
+    fresh buffer but |dx| up to ~2e1 on reused allocations. A plain index_select
+    here would corrupt gradients only intermittently, under memory pressure.
     """
     @staticmethod
     def forward(ctx, xf, gidx, pos, src, pad_idx):
