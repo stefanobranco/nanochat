@@ -62,7 +62,15 @@ m.init_weights()
 n_q = sum(1 for n, _ in m.named_parameters() if "attn_res" in n)
 check(f"2*n_layer+1 == {2 * cfg.n_layer + 1} pseudo-queries", n_q == 2 * cfg.n_layer + 1)
 
-# 5. The resid/x0 lambdas must be frozen, not merely unused: the fused AdamW step
+# 5. Bookkeeping must know about the new params. num_scaling_params() asserts its
+#    breakdown sums to the real parameter count and base_train calls it at startup,
+#    so forgetting a new module there fails the run rather than a report. (It did.)
+counts = m.num_scaling_params()
+check("num_scaling_params accounts for the pseudo-queries",
+      counts["total"] == sum(p.numel() for p in m.parameters()))
+m.num_matmul_params()
+
+# 6. The resid/x0 lambdas must be frozen, not merely unused: the fused AdamW step
 #    cannot handle grad=None, which is how the mHC run first crashed.
 m.setup_optimizer()
 check("resid/x0 lambdas frozen", not m.resid_lambdas.requires_grad and not m.x0_lambdas.requires_grad)

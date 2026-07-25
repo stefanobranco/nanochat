@@ -743,6 +743,9 @@ class GPT(nn.Module):
         scalars = self.resid_lambdas.numel() + self.x0_lambdas.numel() + self.smear_gate.weight.numel() + self.smear_lambda.numel() + self.backout_lambda.numel()
         if self.mhc is not None:
             scalars += sum(p.numel() for p in self.mhc.parameters()) + self.final_read_logits.numel()
+        if self.attn_res is not None:
+            # one d-vector pseudo-query per sublayer: vectors, not matrices
+            scalars += sum(p.numel() for p in self.attn_res.parameters())
         total = wte + value_embeds + lm_head + transformer_matrices + mtp + scalars
         assert total == sum(p.numel() for p in self.parameters()), "Parameter count mismatch"
         return {
