@@ -392,16 +392,21 @@ class AttnRes(nn.Module):
         super().__init__()
         self.q = nn.Parameter(torch.zeros(config.n_embd)) # zero-init is load-bearing
 
-    def forward(self, sources):
+    def forward(self, sources, keys):
+        # `keys` are the RMSNormed sources, normed once when each source is produced.
+        # A source's key is identical for every later sublayer that reads it, so
+        # normalizing inside here would redo the same work O(L^2) times instead of
+        # O(L) — worth ~40% of this layer's cost at d12. Same value either way.
+        #
         # NOTE: the first instance sees a single source (the embedding), so its
         # softmax is identically 1 and its pseudo-query is dead. We deliberately do
         # NOT short-circuit that case: running the softmax anyway keeps the grad at
         # zero rather than None, and a None grad crashes the fused AdamW step.
         q = self.q.to(sources[0].dtype)
-        # Score each source separately rather than stacking: a stacked (S,B,T,C)
-        # buffer would be ~1GB per call at d12/bs16, and only the (S,B,T) scores
-        # are actually needed at full width.
-        logits = torch.stack([(norm(v) * q).sum(-1) for v in sources], dim=0).float()
+        # Score against the keys rather than stacking the values: a stacked
+        # (S,B,T,C) buffer would be ~1GB per call at d12/bs16, and only the
+        # (S,B,T) scores are actually needed at full width.
+        logits = torch.stack([(k * q).sum(-1) for k in keys], dim=0).float()
         w = logits.softmax(dim=0).to(sources[0].dtype) # softmax over the depth axis
         out = w[0].unsqueeze(-1) * sources[0]
         for i in range(1, len(sources)):
@@ -914,15 +919,20 @@ class GPT(nn.Module):
         elif self.attn_res is not None:
             # AttnRes trunk: no running residual. Every sublayer reads a softmax
             # mixture of all previous sublayer outputs, starting from the embedding.
-            sources = [x0]
+            sources, keys = [x0], [norm(x0)]
+
+            def add(v): # each source is normed once, here, and reused as a key
+                sources.append(v)
+                keys.append(norm(v))
+
             for i, block in enumerate(self.transformer.h):
                 ve = self.value_embeds[str(i)](idx).to(x.dtype) if str(i) in self.value_embeds else None
-                h = self.attn_res[2 * i](sources)
+                h = self.attn_res[2 * i](sources, keys)
                 if i == backout_layer + 1:
                     x_backout = h # the state entering this block == the state after backout_layer
-                sources.append(block.attn_out(h, ve, cos_sin, self.window_sizes[i], kv_cache))
-                sources.append(block.mlp_out(self.attn_res[2 * i + 1](sources)))
-            x = self.attn_res[-1](sources)
+                add(block.attn_out(h, ve, cos_sin, self.window_sizes[i], kv_cache))
+                add(block.mlp_out(self.attn_res[2 * i + 1](sources, keys)))
+            x = self.attn_res[-1](sources, keys)
         else:
             for i, block in enumerate(self.transformer.h):
                 x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0

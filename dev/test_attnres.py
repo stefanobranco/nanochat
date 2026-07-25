@@ -25,18 +25,19 @@ cfg = GPTConfig(sequence_len=64, vocab_size=256, n_layer=4, n_head=2, n_kv_head=
 print("AttnRes layer:")
 layer = AttnRes(cfg)
 srcs = [torch.randn(2, 8, 64) for _ in range(5)]
+kx = lambda vs: [norm(v) for v in vs]  # keys are the normed sources (cached by the model)
 
 # 1. Zero-init => uniform attention => plain average of the sources. The paper
 #    calls the zero init crucial precisely because it gives this starting point.
 check("zero-init pseudo-query", float(layer.q.abs().sum()) == 0)
 check("at init, output == mean of sources",
-      torch.allclose(layer(srcs), torch.stack(srcs).mean(0), atol=1e-6))
+      torch.allclose(layer(srcs, kx(srcs)), torch.stack(srcs).mean(0), atol=1e-6))
 
 # 2. Weights are a softmax over the DEPTH axis: convex combination, sums to 1.
 #    With a trained (non-zero) query the output must stay in the sources' hull.
 with torch.no_grad():
     layer.q.normal_(0, 1.0)
-out = layer(srcs)
+out = layer(srcs, kx(srcs))
 q = layer.q
 logits = torch.stack([(norm(v) * q).sum(-1) for v in srcs], 0)
 w = logits.softmax(0)
@@ -48,7 +49,7 @@ check("output == sum_i w_i * v_i", torch.allclose(out, (w.unsqueeze(-1) * torch.
 #    normalized), while leaving the attention weights untouched.
 big = [s.clone() for s in srcs]
 big[2] = big[2] * 50.0
-out_big = layer(big)
+out_big = layer(big, kx(big))
 logits_big = torch.stack([(norm(v) * q).sum(-1) for v in big], 0)
 check("scaling a source changes the output (values un-normalized)",
       not torch.allclose(out, out_big, atol=1e-3))
