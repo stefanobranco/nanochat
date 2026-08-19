@@ -34,6 +34,12 @@ with torch.no_grad():
 # 2. Phase-1 forward runs and produces a finite loss on (B, L*s) input.
 m1.config.tst_bag = S
 m1.train()
+# zero-init output projections block first-step grads to fc/w_fc in ANY config
+# (see dev/test_attnres.py); nudge them off zero before asking about grad flow.
+with torch.no_grad():
+    for n, p in m1.named_parameters():
+        if "c_proj" in n or "w_proj" in n:
+            p.normal_(0, 0.02)
 xr = torch.randint(0, 256, (2, L * S))
 yr = torch.roll(xr, -1, dims=1); yr[:, -1] = -1  # standard next-token labels on the raw stream
 loss = m1(xr, yr)
