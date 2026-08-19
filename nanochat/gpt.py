@@ -889,6 +889,18 @@ class GPT(nn.Module):
     def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean', return_hidden=False):
         B, T = idx.size()
 
+        # TST phase 1 (arXiv 2605.06546): idx arrives as (B, L*s) raw tokens; bag
+        # them BEFORE the rotary machinery so every T below is the L positions the
+        # model actually runs. Embeddings are averaged further down.
+        s_bag = self.config.tst_bag
+        idx_bags = None
+        if s_bag > 0 and targets is not None:
+            assert self.mtp_blocks is None, "TST has no defined composition with MTP"
+            assert T % s_bag == 0
+            idx_bags = idx.view(B, T // s_bag, s_bag)
+            idx = idx_bags[..., 0] # (B, L) view for per-position lookups (VEs bag-average via idx_bags)
+            B, T = idx.size()
+
         # Grab the rotary embeddings for the current sequence length (they are of shape (1, seq_len, 1, head_dim/2))
         assert T <= self.cos.size(1), f"Sequence length grew beyond the rotary embeddings cache: {T} > {self.cos.size(1)}"
         assert idx.device == self.cos.device, f"Rotary embeddings and idx are on different devices: {idx.device} != {self.cos.device}"
@@ -897,21 +909,11 @@ class GPT(nn.Module):
         T0 = 0 if kv_cache is None else kv_cache.get_pos()
         cos_sin = self.cos[:, T0:T0+T], self.sin[:, T0:T0+T] # truncate cache to current sequence length
 
-        # Embed the tokens
-        s_bag = self.config.tst_bag
-        if s_bag > 0 and targets is not None:
-            # TST phase 1 (arXiv 2605.06546): idx is (B, L*s) raw tokens. Bag into
-            # L s-tokens by averaging embeddings (sum in fp32, per the paper's own
-            # code), then run the completely unmodified model on the L positions.
-            assert self.mtp_blocks is None, "TST has no defined composition with MTP"
-            assert T % s_bag == 0
-            idx_bags = idx.view(B, T // s_bag, s_bag)
+        # Embed the tokens (under TST, the fp32 mean of the bag's embeddings — the
+        # paper's own code sums in float32 for precision)
+        if idx_bags is not None:
             x = self.transformer.wte(idx_bags).float().mean(dim=-2)
-            idx = idx_bags[..., 0] # value embeds read a (B, L) idx; bagged below
-            B, T = idx.size()
-            cos_sin = self.cos[:, T0:T0+T], self.sin[:, T0:T0+T]
         else:
-            idx_bags = None
             x = self.transformer.wte(idx) # embed current token
         x = x.to(COMPUTE_DTYPE) # ensure activations are in compute dtype (no-op usually, but active for fp16 code path)
         x = norm(x)
