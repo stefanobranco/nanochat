@@ -60,6 +60,11 @@ class GPTConfig:
     # Fuse the vocab projection into the loss instead of materializing fp32 logits.
     # MTP makes this matter twice over. Training only (the 'mean' reduction).
     fused_ce: bool = False
+    # E5: TST token superposition (arXiv 2605.06546), phase-1 flag. idx arrives as
+    # (B, L*s) raw tokens, bagged into L s-tokens by mean embedding; the loss is
+    # the mean of s CE calls against the next bag. 0 = off (= phase 2 = baseline).
+    # No defined composition with MTP (the paper punts); asserted off together.
+    tst_bag: int = 0
     # E1: Hyperball / MuonH (arXiv 2606.16899). Muon matrices live on fixed
     # Frobenius spheres (radius = init norm); replaces their weight decay.
     # Changes init: output projections get nonzero init (R=0 is degenerate).
@@ -68,6 +73,14 @@ class GPTConfig:
 
 def norm(x):
     return F.rms_norm(x, (x.size(-1),)) # note that this will run in bf16, seems ok
+
+
+def _ve_lookup(emb, idx, idx_bags):
+    """Value-embedding lookup; under TST bagging, averaged over the bag exactly
+    like the input embedding (a judgment call — the paper does not use VEs)."""
+    if idx_bags is not None:
+        return emb(idx_bags).float().mean(dim=-2)
+    return emb(idx)
 
 class Linear(nn.Linear):
     """nn.Linear that casts weights to match input dtype in forward.
@@ -885,7 +898,21 @@ class GPT(nn.Module):
         cos_sin = self.cos[:, T0:T0+T], self.sin[:, T0:T0+T] # truncate cache to current sequence length
 
         # Embed the tokens
-        x = self.transformer.wte(idx) # embed current token
+        s_bag = self.config.tst_bag
+        if s_bag > 0 and targets is not None:
+            # TST phase 1 (arXiv 2605.06546): idx is (B, L*s) raw tokens. Bag into
+            # L s-tokens by averaging embeddings (sum in fp32, per the paper's own
+            # code), then run the completely unmodified model on the L positions.
+            assert self.mtp_blocks is None, "TST has no defined composition with MTP"
+            assert T % s_bag == 0
+            idx_bags = idx.view(B, T // s_bag, s_bag)
+            x = self.transformer.wte(idx_bags).float().mean(dim=-2)
+            idx = idx_bags[..., 0] # value embeds read a (B, L) idx; bagged below
+            B, T = idx.size()
+            cos_sin = self.cos[:, T0:T0+T], self.sin[:, T0:T0+T]
+        else:
+            idx_bags = None
+            x = self.transformer.wte(idx) # embed current token
         x = x.to(COMPUTE_DTYPE) # ensure activations are in compute dtype (no-op usually, but active for fp16 code path)
         x = norm(x)
 
@@ -929,7 +956,7 @@ class GPT(nn.Module):
             X = x.unsqueeze(2).expand(-1, -1, self.config.n_streams, -1).contiguous()
             for i, block in enumerate(self.transformer.h):
                 x_in = self.mhc[i].read(X)
-                ve = self.value_embeds[str(i)](idx).to(x.dtype) if str(i) in self.value_embeds else None
+                ve = self._ve_lookup(self.value_embeds[str(i)], idx, idx_bags).to(x.dtype) if str(i) in self.value_embeds else None
                 y = block(x_in, ve, cos_sin, self.window_sizes[i], kv_cache) - x_in # block adds x_in internally; extract the delta
                 X = self.mhc[i](X, x_in) + self.mhc[i].write_gate.to(X.dtype).view(1, 1, -1, 1) * y.unsqueeze(2)
                 if i == backout_layer:
@@ -945,7 +972,7 @@ class GPT(nn.Module):
                 keys.append(norm(v))
 
             for i, block in enumerate(self.transformer.h):
-                ve = self.value_embeds[str(i)](idx).to(x.dtype) if str(i) in self.value_embeds else None
+                ve = self._ve_lookup(self.value_embeds[str(i)], idx, idx_bags).to(x.dtype) if str(i) in self.value_embeds else None
                 h = self.attn_res[2 * i](sources, keys)
                 if i == backout_layer + 1:
                     x_backout = h # the state entering this block == the state after backout_layer
@@ -955,7 +982,7 @@ class GPT(nn.Module):
         else:
             for i, block in enumerate(self.transformer.h):
                 x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
-                ve = self.value_embeds[str(i)](idx).to(x.dtype) if str(i) in self.value_embeds else None
+                ve = self._ve_lookup(self.value_embeds[str(i)], idx, idx_bags).to(x.dtype) if str(i) in self.value_embeds else None
                 x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
                 if i == backout_layer:
                     x_backout = x
@@ -988,7 +1015,20 @@ class GPT(nn.Module):
             return F.cross_entropy(lg.view(-1, lg.size(-1)), tgt.reshape(-1),
                                    ignore_index=-1, reduction=loss_reduction)
 
-        loss = head_loss(h0, targets)
+        if s_bag > 0:
+            # TST multi-hot CE: the mean of s ordinary CE calls on the SAME logits,
+            # each against the bag member i positions ahead. Targets arrive as the
+            # standard next-token labels over the raw (B, L*s) stream; the paper's
+            # left-shift-by-(s-1) + view constructs "bag j predicts bag j+1".
+            tgt = F.pad(targets, (0, s_bag - 1), value=-1)[:, s_bag - 1:].reshape(B, T, s_bag)
+            logits = shared_head(h0)
+            flat = logits.view(-1, logits.size(-1))
+            loss = torch.stack([
+                F.cross_entropy(flat, tgt[..., i].reshape(-1), ignore_index=-1)
+                for i in range(s_bag)
+            ]).mean()
+        else:
+            loss = head_loss(h0, targets)
 
         # Multi-Token Prediction (DeepSeek-V3): sequential modules predict t+2, t+3, ...
         # Each depth k combines the previous depth's hidden with the embedding of the

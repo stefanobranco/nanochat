@@ -63,6 +63,8 @@ parser.add_argument("--router-affinity", type=str, default="sigmoid", choices=["
 parser.add_argument("--n-streams", type=int, default=1, help="mHC residual streams (DSv4); 1 = plain residual")
 parser.add_argument("--n-mtp", type=int, default=0, help="MTP depth (DSv3 multi-token prediction); 0 = off")
 parser.add_argument("--attn-res", action="store_true", help="AttnRes (Kimi arXiv 2603.15031), Full variant; replaces the residual stream")
+parser.add_argument("--tst-bag", type=int, default=0, help="TST (arXiv 2605.06546) bag size s for phase 1; 0 = off. Paper-robust range 4-8")
+parser.add_argument("--tst-ratio", type=float, default=0.3, help="fraction of steps in the TST superposition phase (paper-robust 0.2-0.4)")
 parser.add_argument("--seq-ramp", type=str, default="", help="SkyLadder-style context ramp (arXiv 2503.15450): comma list of seq@frac phases before full context, e.g. '512@0.25,1024@0.5'. Device batch scales inversely, so tokens/step is unchanged")
 parser.add_argument("--hyperball", action="store_true", help="MuonH (arXiv 2606.16899): fixed-norm Muon matrices, replaces their weight decay; nonzero proj init")
 parser.add_argument("--fused-ce", action="store_true", help="fuse the vocab projection into the loss (skips materializing fp32 logits; matters twice over with MTP)")
@@ -161,6 +163,7 @@ def build_model_meta(depth):
         router_affinity=args.router_affinity, n_streams=args.n_streams,
         n_mtp=args.n_mtp, mtp_weight=args.mtp_weight, attn_res=args.attn_res,
         fused_ce=args.fused_ce, hyperball=args.hyperball,
+        tst_bag=args.tst_bag if args.tst_bag > 0 else 0,
     )
     with torch.device("meta"):
         model_meta = GPT(config)
@@ -389,7 +392,24 @@ def build_train_loader(seq_len, state):
 current_seq_len = seq_len_at(0.0)
 if current_seq_len != args.max_seq_len:
     print0(f"Context ramp: phases {seq_ramp}, starting at seq {current_seq_len}")
-train_loader = build_train_loader(current_seq_len, dataloader_resume_state_dict)
+
+# TST phase 1 (arXiv 2605.06546): each row carries s x the raw tokens, bagged
+# down to max_seq_len positions inside the model (their equal-FLOPs convention).
+assert not (args.tst_bag > 0 and (args.seq_ramp or args.n_mtp > 0)), "TST composes with neither seq-ramp nor MTP"
+tst_active = args.tst_bag > 0
+def loader_row_tokens():
+    return current_seq_len * (args.tst_bag if tst_active else 1)
+
+def build_tst_aware_loader(state):
+    # NOTE: device batch is NOT scaled here — a TST row has s*T raw tokens but the
+    # model runs T positions, so FLOPs per microstep match the baseline exactly.
+    return tokenizing_distributed_data_loader_with_state_bos_bestfit(tokenizer, args.device_batch_size, loader_row_tokens(), split="train", device=device, resume_state_dict=state)
+
+if tst_active:
+    print0(f"TST: bag {args.tst_bag}, superposition for the first {args.tst_ratio:.0%} of steps")
+    train_loader = build_tst_aware_loader(dataloader_resume_state_dict)
+else:
+    train_loader = build_train_loader(current_seq_len, dataloader_resume_state_dict)
 build_val_loader = lambda: tokenizing_distributed_data_loader_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="val", device=device)
 x, y, dataloader_state_dict = next(train_loader) # kick off load of the very first batch of data
 
@@ -579,6 +599,13 @@ while True:
         print0(f"Context ramp: seq {current_seq_len} -> {ramp_seq} at step {step}")
         current_seq_len = ramp_seq
         train_loader = build_train_loader(ramp_seq, dataloader_state_dict)
+    # TST hard switch to the standard objective (paper: no interpolation, nothing
+    # reset; embeddings and head carry over untouched — their key ablation)
+    if tst_active and step >= round(args.tst_ratio * num_iterations):
+        print0(f"TST: superposition phase over at step {step}, reverting to next-token prediction")
+        tst_active = False
+        orig_model.config.tst_bag = 0 # dynamo re-guards on the attr; one recompile
+        train_loader = build_tst_aware_loader(dataloader_state_dict)
     for micro_step in range(grad_accum_steps):
         loss = model(x, y)
         train_loss = loss.detach() # for logging
