@@ -60,6 +60,10 @@ class GPTConfig:
     # Fuse the vocab projection into the loss instead of materializing fp32 logits.
     # MTP makes this matter twice over. Training only (the 'mean' reduction).
     fused_ce: bool = False
+    # E1: Hyperball / MuonH (arXiv 2606.16899). Muon matrices live on fixed
+    # Frobenius spheres (radius = init norm); replaces their weight decay.
+    # Changes init: output projections get nonzero init (R=0 is degenerate).
+    hyperball: bool = False
 
 
 def norm(x):
@@ -525,22 +529,36 @@ class GPT(nn.Module):
         init_blocks = list(self.transformer.h)
         if self.mtp_blocks is not None:
             init_blocks += list(self.mtp_blocks) # MTP blocks init identically to trunk blocks
+
+        # Hyperball (MuonH, arXiv 2606.16899) fixes every Muon
+        # matrix on the Frobenius sphere of its INIT norm, so zero-init output
+        # projections would be degenerate (R = 0, the sphere is a point). The
+        # authors' own GPT-2-scale record un-zeros them with per-role multipliers
+        # on a fan-in init (attn.proj x1.25, mlp.proj x3.0); we do the same. The
+        # multipliers are their tuned values, a judgment call carried over.
+        def init_proj(w, fan_in, mult):
+            if self.config.hyperball:
+                b = 3**0.5 * fan_in**-0.5 * mult
+                torch.nn.init.uniform_(w, -b, b)
+            else:
+                torch.nn.init.zeros_(w) # projections are zero
         for block in init_blocks:
             torch.nn.init.uniform_(block.attn.c_q.weight, -s, s) # weights use Uniform to avoid outliers
             torch.nn.init.uniform_(block.attn.c_k.weight, -s, s)
             torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
-            torch.nn.init.zeros_(block.attn.c_proj.weight) # projections are zero
+            init_proj(block.attn.c_proj.weight, n_embd, 1.25)
             if isinstance(block.mlp, MoEMLP):
+                H = block.mlp.w_fc.size(-1)
                 torch.nn.init.uniform_(block.mlp.router.weight, -s, s)
                 torch.nn.init.zeros_(block.mlp.route_bias)
                 torch.nn.init.uniform_(block.mlp.w_fc, -s * 0.4, s * 0.4)
-                torch.nn.init.zeros_(block.mlp.w_proj)
+                init_proj(block.mlp.w_proj, H, 3.0)
                 if block.mlp.shared_fc is not None:
                     torch.nn.init.uniform_(block.mlp.shared_fc.weight, -s * 0.4, s * 0.4)
-                    torch.nn.init.zeros_(block.mlp.shared_proj.weight)
+                    init_proj(block.mlp.shared_proj.weight, block.mlp.shared_fc.weight.size(0), 3.0)
             else:
                 torch.nn.init.uniform_(block.mlp.c_fc.weight, -s * 0.4, s * 0.4)  # 0.4x init scale for c_fc
-                torch.nn.init.zeros_(block.mlp.c_proj.weight)
+                init_proj(block.mlp.c_proj.weight, 4 * n_embd, 3.0)
         # MTP projection matrices M_k (concat of two normed d-vectors -> d)
         if self.mtp_proj is not None:
             for proj in self.mtp_proj:
@@ -821,6 +839,7 @@ class GPT(nn.Module):
             param_groups.append(dict(
                 kind='muon', params=group_params, lr=matrix_lr,
                 momentum=0.95, ns_steps=5, beta2=0.9, weight_decay=weight_decay,
+                hyperball=self.config.hyperball, # MuonH: wd is ignored for these groups
             ))
 
         optimizer = MuonAdamW(param_groups)

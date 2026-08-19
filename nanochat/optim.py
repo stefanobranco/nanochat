@@ -120,6 +120,7 @@ def muon_step_fused(
     beta2_t: Tensor,                # () - 0-D CPU tensor, beta2 for second moment
     ns_steps: int,                  # 5 - number of Newton-Schulz/Polar Express iterations
     red_dim: int,                   # -1 or -2 - reduction dimension for variance
+    hyperball: bool = False,        # MuonH (arXiv 2606.16899): fixed-norm weights + fixed-norm updates
 ) -> None:
     """
     Fused Muon step: momentum -> polar_express -> variance_reduction -> cautious_update
@@ -173,11 +174,26 @@ def muon_step_fused(
     final_scale = step_size * (v_norm / v_norm_new.clamp_min(1e-10))
     g = g * final_scale.to(g.dtype)
 
-    # Cautious weight decay + parameter update
-    lr = lr_t.to(g.dtype)
-    wd = wd_t.to(g.dtype)
-    mask = (g * stacked_params) >= 0
-    stacked_params.sub_(lr * g + lr * wd * stacked_params * mask)
+    if hyperball:
+        # MuonH (Hyperball, arXiv 2606.16899): W <- R * Normalize(W - lr * R * Normalize(u)).
+        # Each trailing (m, n) matrix lives on its own Frobenius sphere whose radius R
+        # is implicit — the current fp32 master-weight norm, which this update leaves
+        # exactly invariant. Replaces weight decay on these params entirely (wd_t is
+        # ignored), and any scalar shape factor on the update cancels under the
+        # normalization. Momentum/second-moment buffers are deliberately untouched
+        # (the paper constrains only the final update and the weight, not the state).
+        lr = lr_t.float()
+        p_norm = stacked_params.float().norm(dim=(-2, -1), keepdim=True)
+        u_norm = g.float().norm(dim=(-2, -1), keepdim=True).clamp_min(1e-10)
+        new_p = stacked_params.float() - (lr * (p_norm / u_norm)) * g.float()
+        new_norm = new_p.norm(dim=(-2, -1), keepdim=True).clamp_min(1e-10)
+        stacked_params.copy_((new_p * (p_norm / new_norm)).to(stacked_params.dtype))
+    else:
+        # Cautious weight decay + parameter update
+        lr = lr_t.to(g.dtype)
+        wd = wd_t.to(g.dtype)
+        mask = (g * stacked_params) >= 0
+        stacked_params.sub_(lr * g + lr * wd * stacked_params * mask)
 
 # -----------------------------------------------------------------------------
 
@@ -394,13 +410,18 @@ class MuonAdamW(torch.optim.Optimizer):
             # Fill 0-D tensors and run fused kernel
             self._muon_momentum_t.fill_(group["momentum"])
             self._muon_beta2_t.fill_(group["beta2"])
-            self._muon_lr_t.fill_(group["lr"] * max(1.0, shape[-2] / shape[-1])**0.5)
+            hyperball = group.get("hyperball", False)
+            # The rectangular shape factor scales the *update*, which hyperball
+            # normalizes away — folding it into lr would silently rescale the
+            # angular step instead, so skip it there.
+            lr_factor = 1.0 if hyperball else max(1.0, shape[-2] / shape[-1])**0.5
+            self._muon_lr_t.fill_(group["lr"] * lr_factor)
             self._muon_wd_t.fill_(group["weight_decay"])
             muon_step_fused(
                 grad_chunk[:num_owned], stacked_owned,
                 state["momentum_buffer"][:num_owned], state["second_momentum_buffer"][:num_owned],
                 self._muon_momentum_t, self._muon_lr_t, self._muon_wd_t, self._muon_beta2_t,
-                group["ns_steps"], red_dim,
+                group["ns_steps"], red_dim, hyperball,
             )
 
         if info['stacked_grads'] is None:

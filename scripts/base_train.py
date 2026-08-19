@@ -63,6 +63,7 @@ parser.add_argument("--router-affinity", type=str, default="sigmoid", choices=["
 parser.add_argument("--n-streams", type=int, default=1, help="mHC residual streams (DSv4); 1 = plain residual")
 parser.add_argument("--n-mtp", type=int, default=0, help="MTP depth (DSv3 multi-token prediction); 0 = off")
 parser.add_argument("--attn-res", action="store_true", help="AttnRes (Kimi arXiv 2603.15031), Full variant; replaces the residual stream")
+parser.add_argument("--hyperball", action="store_true", help="MuonH (arXiv 2606.16899): fixed-norm Muon matrices, replaces their weight decay; nonzero proj init")
 parser.add_argument("--fused-ce", action="store_true", help="fuse the vocab projection into the loss (skips materializing fp32 logits; matters twice over with MTP)")
 parser.add_argument("--compile-mode", type=str, default="default", choices=["default", "max-autotune", "max-autotune-no-cudagraphs", "reduce-overhead"], help="torch.compile mode; max-autotune trades a longer compile for tuned kernels")
 parser.add_argument("--mtp-weight", type=float, default=0.3, help="MTP auxiliary loss weight")
@@ -157,7 +158,7 @@ def build_model_meta(depth):
         expert_hidden=args.expert_hidden, moe_first_dense=args.moe_first_dense,
         router_affinity=args.router_affinity, n_streams=args.n_streams,
         n_mtp=args.n_mtp, mtp_weight=args.mtp_weight, attn_res=args.attn_res,
-        fused_ce=args.fused_ce,
+        fused_ce=args.fused_ce, hyperball=args.hyperball,
     )
     with torch.device("meta"):
         model_meta = GPT(config)
@@ -328,13 +329,20 @@ if weight_decay_scaled != args.weight_decay:
 
 # -----------------------------------------------------------------------------
 # Initialize the Optimizer (combined MuonAdamW: Muon for matrix params, AdamW for rest)
+# MuonH LR transfer (levanter docstring, arXiv 2606.16899): the constrained lr is
+# the angular step, and the weight-decay equilibrium angular speed of the Muon+wd
+# baseline is ~sqrt(lr*wd) — so that is the equivalent starting point.
+matrix_lr = args.matrix_lr
+if args.hyperball:
+    matrix_lr = (args.matrix_lr * args.weight_decay) ** 0.5
+    print0(f"MuonH lr transfer: sqrt({args.matrix_lr} * {args.weight_decay}) = {matrix_lr:.4f}")
 optimizer = model.setup_optimizer(
     # AdamW hyperparameters
     unembedding_lr=args.unembedding_lr * batch_lr_scale,
     embedding_lr=args.embedding_lr * batch_lr_scale,
     scalar_lr=args.scalar_lr * batch_lr_scale,
     # Muon hyperparameters
-    matrix_lr=args.matrix_lr * batch_lr_scale,
+    matrix_lr=matrix_lr * batch_lr_scale,
     weight_decay=weight_decay_scaled,
 )
 
@@ -544,10 +552,14 @@ while True:
         x, y, dataloader_state_dict = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
     # step the optimizer
     lrm = get_lr_multiplier(step)
+    # MuonH groups follow the authors' strongest small-scale config: linear decay
+    # to zero over the ENTIRE run, no warmup (the constrained lr is directly the
+    # angular step, so there is no weight-decay equilibrium lag to warm into).
+    lrm_hyperball = 1.0 - step / num_iterations
     muon_momentum = get_muon_momentum(step)
     muon_weight_decay = get_weight_decay(step)
     for group in optimizer.param_groups:
-        group["lr"] = group["initial_lr"] * lrm
+        group["lr"] = group["initial_lr"] * (lrm_hyperball if group.get("hyperball") else lrm)
         if group['kind'] == 'muon':
             group["momentum"] = muon_momentum
             group["weight_decay"] = muon_weight_decay
