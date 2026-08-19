@@ -63,6 +63,7 @@ parser.add_argument("--router-affinity", type=str, default="sigmoid", choices=["
 parser.add_argument("--n-streams", type=int, default=1, help="mHC residual streams (DSv4); 1 = plain residual")
 parser.add_argument("--n-mtp", type=int, default=0, help="MTP depth (DSv3 multi-token prediction); 0 = off")
 parser.add_argument("--attn-res", action="store_true", help="AttnRes (Kimi arXiv 2603.15031), Full variant; replaces the residual stream")
+parser.add_argument("--seq-ramp", type=str, default="", help="SkyLadder-style context ramp (arXiv 2503.15450): comma list of seq@frac phases before full context, e.g. '512@0.25,1024@0.5'. Device batch scales inversely, so tokens/step is unchanged")
 parser.add_argument("--hyperball", action="store_true", help="MuonH (arXiv 2606.16899): fixed-norm Muon matrices, replaces their weight decay; nonzero proj init")
 parser.add_argument("--fused-ce", action="store_true", help="fuse the vocab projection into the loss (skips materializing fp32 logits; matters twice over with MTP)")
 parser.add_argument("--compile-mode", type=str, default="default", choices=["default", "max-autotune", "max-autotune-no-cudagraphs", "reduce-overhead"], help="torch.compile mode; max-autotune trades a longer compile for tuned kernels")
@@ -360,7 +361,35 @@ if scaler is not None:
 # -----------------------------------------------------------------------------
 # Initialize the DataLoaders for train/val
 dataloader_resume_state_dict = None if not resuming else meta_data["dataloader_state_dict"]
-train_loader = tokenizing_distributed_data_loader_with_state_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="train", device=device, resume_state_dict=dataloader_resume_state_dict)
+# SkyLadder context ramp (arXiv 2503.15450): train on short sequences early, full
+# context late. Device batch size scales inversely with sequence length, so
+# tokens per microstep — and therefore grad-accum, schedules and token accounting
+# — are unchanged; only attention FLOPs shrink during the early phases. The
+# dataloader state (parquet position) is sequence-length-agnostic, so each phase
+# switch resumes the data stream exactly where the previous phase left off.
+seq_ramp = [] # list of (seq_len, until_frac), ending implicitly with (max_seq_len, 1.0)
+if args.seq_ramp:
+    for part in args.seq_ramp.split(","):
+        sl, frac = part.split("@")
+        sl, frac = int(sl), float(frac)
+        assert args.max_seq_len % sl == 0, f"ramp seq {sl} must divide max_seq_len"
+        seq_ramp.append((sl, frac))
+    assert all(f1 < f2 for (_, f1), (_, f2) in zip(seq_ramp, seq_ramp[1:]))
+
+def seq_len_at(frac_done):
+    for sl, until in seq_ramp:
+        if frac_done < until:
+            return sl
+    return args.max_seq_len
+
+def build_train_loader(seq_len, state):
+    bs = args.device_batch_size * (args.max_seq_len // seq_len)
+    return tokenizing_distributed_data_loader_with_state_bos_bestfit(tokenizer, bs, seq_len, split="train", device=device, resume_state_dict=state)
+
+current_seq_len = seq_len_at(0.0)
+if current_seq_len != args.max_seq_len:
+    print0(f"Context ramp: phases {seq_ramp}, starting at seq {current_seq_len}")
+train_loader = build_train_loader(current_seq_len, dataloader_resume_state_dict)
 build_val_loader = lambda: tokenizing_distributed_data_loader_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="val", device=device)
 x, y, dataloader_state_dict = next(train_loader) # kick off load of the very first batch of data
 
@@ -542,6 +571,14 @@ while True:
     # evaluate the gradient
     synchronize()
     t0 = time.time()
+    # context-ramp phase switch: rebuild the loader at the new length, resuming
+    # the data stream from the current position (the already-prefetched batch at
+    # the OLD length is consumed first — one straggler microbatch per boundary).
+    ramp_seq = seq_len_at(step / num_iterations)
+    if ramp_seq != current_seq_len:
+        print0(f"Context ramp: seq {current_seq_len} -> {ramp_seq} at step {step}")
+        current_seq_len = ramp_seq
+        train_loader = build_train_loader(ramp_seq, dataloader_state_dict)
     for micro_step in range(grad_accum_steps):
         loss = model(x, y)
         train_loss = loss.detach() # for logging
