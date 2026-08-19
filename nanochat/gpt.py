@@ -958,7 +958,7 @@ class GPT(nn.Module):
             X = x.unsqueeze(2).expand(-1, -1, self.config.n_streams, -1).contiguous()
             for i, block in enumerate(self.transformer.h):
                 x_in = self.mhc[i].read(X)
-                ve = self._ve_lookup(self.value_embeds[str(i)], idx, idx_bags).to(x.dtype) if str(i) in self.value_embeds else None
+                ve = _ve_lookup(self.value_embeds[str(i)], idx, idx_bags).to(x.dtype) if str(i) in self.value_embeds else None
                 y = block(x_in, ve, cos_sin, self.window_sizes[i], kv_cache) - x_in # block adds x_in internally; extract the delta
                 X = self.mhc[i](X, x_in) + self.mhc[i].write_gate.to(X.dtype).view(1, 1, -1, 1) * y.unsqueeze(2)
                 if i == backout_layer:
@@ -974,7 +974,7 @@ class GPT(nn.Module):
                 keys.append(norm(v))
 
             for i, block in enumerate(self.transformer.h):
-                ve = self._ve_lookup(self.value_embeds[str(i)], idx, idx_bags).to(x.dtype) if str(i) in self.value_embeds else None
+                ve = _ve_lookup(self.value_embeds[str(i)], idx, idx_bags).to(x.dtype) if str(i) in self.value_embeds else None
                 h = self.attn_res[2 * i](sources, keys)
                 if i == backout_layer + 1:
                     x_backout = h # the state entering this block == the state after backout_layer
@@ -984,7 +984,7 @@ class GPT(nn.Module):
         else:
             for i, block in enumerate(self.transformer.h):
                 x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
-                ve = self._ve_lookup(self.value_embeds[str(i)], idx, idx_bags).to(x.dtype) if str(i) in self.value_embeds else None
+                ve = _ve_lookup(self.value_embeds[str(i)], idx, idx_bags).to(x.dtype) if str(i) in self.value_embeds else None
                 x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
                 if i == backout_layer:
                     x_backout = x
