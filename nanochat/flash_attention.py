@@ -30,35 +30,16 @@ def _load_flash_attention_3():
         # Blackwell (sm100) needs SDPA fallback until FA3 is recompiled or FA4 is released
         import os
         os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
-        from kernels import get_kernel, has_kernel
-
-        def _shim_config_module(iface):
-            # The cu126 builds of varunneal/flash-attention-3 do
-            # `from flash_attn_config import CONFIG` (absolute) inside a lazily
-            # executed meta function; only the cu130 build got the relative-import
-            # fix upstream. Pre-seed sys.modules with the sibling file so the
-            # absolute import resolves — otherwise torch.compile's fake-tensor
-            # tracing dies with ModuleNotFoundError('flash_attn_config').
-            import sys, importlib.util
-            if "flash_attn_config" not in sys.modules:
-                cfg = os.path.join(os.path.dirname(iface.__file__), "flash_attn_config.py")
-                if os.path.exists(cfg):
-                    spec = importlib.util.spec_from_file_location("flash_attn_config", cfg)
-                    mod = importlib.util.module_from_spec(spec)
-                    spec.loader.exec_module(mod)
-                    sys.modules["flash_attn_config"] = mod
-            return iface
-
-        # The varunneal kernel obtains better results for H100/Hopper
-        if major == 9:
-            hf_kernel = "varunneal/flash-attention-3"
-            return _shim_config_module(get_kernel(hf_kernel).flash_attn_interface)
-        else:
-            hf_kernel = "kernels-community/flash-attn3"
-            if has_kernel(hf_kernel):
-                return get_kernel(hf_kernel).flash_attn_interface
-            else:
-                return None
+        from kernels import get_kernel
+        # kernels-community/flash-attn3 for every arch. We used to prefer
+        # varunneal/flash-attention-3 on Hopper, but its cu126 build produces
+        # NaNs and a ~90GB memory blowup (verified on H200 + torch 2.12.1+cu126,
+        # 2026-08-19), and kernels >=0.14 can't load user-account repos at all
+        # (trust-check 404, versioned-API 401). The community build has a
+        # stable-ABI cu126 variant, matches SDPA to bf16 tolerance, and lives in
+        # an org account that passes the new checks. version=1 pins the stable
+        # kernel API line as required by kernels >=0.14.
+        return get_kernel("kernels-community/flash-attn3", version=1).flash_attn_interface
 
     except Exception:
         return None
